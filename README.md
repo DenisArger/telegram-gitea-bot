@@ -19,6 +19,7 @@
   - uvicorn
   - asgiref
 
+
   ## Настройка Gitea
 
 1. Создайте webhook в Gitea:
