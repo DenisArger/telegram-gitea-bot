@@ -103,6 +103,8 @@ class TelegramWebhookBot:
                 await self.handle_unassigned_event(data, main_user, repo_name, branch, rep_link)
             elif action == "review_requested":
                 await self.handle_review_requested_event(data, main_user, repo_name, branch, rep_link)
+            elif action == "review_request_removed":
+                await self.handle_review_request_removed_event(data, main_user, repo_name, branch, rep_link)
             elif action in ["opened", "closed", "reopened", "created", "edited", "deleted"]:
                 await self.handle_generic_event(action, data, main_user, repo_name, branch, rep_link)
             elif action == "reviewed":
@@ -209,6 +211,25 @@ class TelegramWebhookBot:
                 await self.send_telegram_message(message, rep_link)
             else:
                 print(f"Рецензент не найден: {reviewer['login']}")
+
+    async def handle_review_request_removed_event(self, data: Dict, main_user: Dict, repo_name: str, branch: str, rep_link: str):
+        """Обработка снятия запроса на ревью."""
+        reviewer = data.get("requested_reviewer")
+        if not reviewer:
+            print("Нет removed reviewer в событии:", data)
+            return
+
+        reviewer_tg_name = next(
+            (user["tgName"] for user in self.arr_of_users if user["repName"] == reviewer.get("login")), None)
+        if reviewer_tg_name:
+            message = (
+                f"🔔 @{reviewer_tg_name}\n"
+                f"❌ Запрос на ревью отозван для PR #{data['pull_request']['number']}\n"
+                f"Ветка: {branch}"
+            )
+            await self.send_telegram_message(message, rep_link)
+        else:
+            print(f"Рецензент не найден: {reviewer.get('login')}")
 
     async def handle_generic_event(self, action: str, data: Dict, main_user: Dict, repo_name: str, branch: str,
                                    rep_link: str):
