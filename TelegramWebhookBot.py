@@ -4,6 +4,7 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from typing import Dict, Optional
 from dotenv import load_dotenv
 import asyncio
+import json
 import os
 import random
 import traceback
@@ -26,17 +27,7 @@ class TelegramWebhookBot:
         self.MESSAGE_THREAD_ID = int(message_thread_id)
 
         # Массив пользователей (сопоставление имен из Gitea с Telegram)
-        self.arr_of_users = [
-            {"repName": "AnatolyHryntsevich", "tgName": "htyntsevich"},
-            {"repName": "LeonidParfenov", "tgName": "ljkiu_o"},
-            {"repName": "RomanProtchenko", "tgName": "nesterpetrov"},
-            {"repName": "DenisArger", "tgName": "Denis_Arger"},
-            {"repName": "VeronikaRitareva", "tgName": "vritareva"},
-            {"repName": "AnastasiaKonopatskaya", "tgName": "anstsknptsk"},
-            {"repName": "NikitaHalukh", "tgName": "gn370p0"},
-            {"repName": "AleksandrOvsyanikov", "tgName": "iressq"},
-            {"repName": "DaniilKrauchanka", "tgName": "Krava_DpS"},
-        ]
+        self.arr_of_users = self.load_users()
 
         # Инициализация Flask и Telegram Bot
         self.app = Flask(__name__)
@@ -51,6 +42,17 @@ class TelegramWebhookBot:
 
     def health_check(self):
         return "ok", 200
+
+    def load_users(self):
+        users_path = os.path.join(os.path.dirname(__file__), "users.json")
+        try:
+            with open(users_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                raise ValueError("users.json должен содержать массив пользователей")
+            return data
+        except Exception as e:
+            raise ValueError(f"Не удалось загрузить users.json: {e}")
 
     def weekly_reminder(self):
         try:
