@@ -19,6 +19,13 @@
   - uvicorn
   - asgiref
 
+## Переменные окружения
+
+Проект использует файл `.env`. Создайте его на основе `.env.example` и укажите свои значения:
+
+- `TELEGRAM_BOT_TOKEN` — токен бота Telegram.
+- `TELEGRAM_TARGET_CHAT_ID` — ID чата/канала для уведомлений (например, `-100...`).
+- `TELEGRAM_MESSAGE_THREAD_ID` — ID темы в форуме Telegram.
 
   ## Настройка Gitea
 

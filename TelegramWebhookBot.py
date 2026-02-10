@@ -2,14 +2,26 @@
 from flask import Flask, request, jsonify
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from typing import Dict, Optional
+from dotenv import load_dotenv
+import os
 import traceback
 
 class TelegramWebhookBot:
     def __init__(self):
+        load_dotenv()
+
         # Конфигурация
-        self.TOKEN = "6383424053:AAE-EpvkiSDJl78_6xxIGEEpX6RD81HIb1w"
-        self.TARGET_CHAT_ID = "-1001853665562"
-        self.MESSAGE_THREAD_ID = 333
+        self.TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.TARGET_CHAT_ID = os.getenv("TELEGRAM_TARGET_CHAT_ID")
+        message_thread_id = os.getenv("TELEGRAM_MESSAGE_THREAD_ID")
+
+        if not self.TOKEN or not self.TARGET_CHAT_ID or not message_thread_id:
+            raise ValueError(
+                "Missing required environment variables: "
+                "TELEGRAM_BOT_TOKEN, TELEGRAM_TARGET_CHAT_ID, TELEGRAM_MESSAGE_THREAD_ID"
+            )
+
+        self.MESSAGE_THREAD_ID = int(message_thread_id)
 
         # Массив пользователей (сопоставление имен из Gitea с Telegram)
         self.arr_of_users = [
@@ -310,4 +322,4 @@ if __name__ == "__main__":
     from asgiref.wsgi import WsgiToAsgi
     asgi_app = WsgiToAsgi(app)
     import uvicorn
-    uvicorn.run(asgi_app, host="127.0.0.1", port=3333)
+    uvicorn.run(asgi_app, host="0.0.0.0", port=3333)
