@@ -185,8 +185,12 @@ class TelegramWebhookBot:
         """Обработка запроса на проверку."""
         requested_reviewers = data.get("pull_request", {}).get("requested_reviewers", [])
         if not requested_reviewers:
-            print("Список запрошенных рецензентов пуст:", data)
-            return
+            single_reviewer = data.get("requested_reviewer")
+            if single_reviewer:
+                requested_reviewers = [single_reviewer]
+            else:
+                print("Список запрошенных рецензентов пуст:", data)
+                return
 
         for reviewer in requested_reviewers:
             reviewer_tg_name = next(
