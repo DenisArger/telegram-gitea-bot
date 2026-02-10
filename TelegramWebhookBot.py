@@ -42,6 +42,11 @@ class TelegramWebhookBot:
 
         # Регистрация маршрута для webhook
         self.app.route("/", methods=["POST"])(self.webhook)
+        # Health-check for platform probes
+        self.app.route("/", methods=["GET"])(self.health_check)
+
+    def health_check(self):
+        return "ok", 200
 
     def run(self, host: str = "127.0.0.1", port: int = 3333):
         """Запуск сервера."""
@@ -315,11 +320,7 @@ class TelegramWebhookBot:
         await self.send_telegram_message(message, rep_link)
 
 
-# Запуск бота
+# Запуск бота (локально)
 if __name__ == "__main__":
     bot = TelegramWebhookBot()
-    app = bot.app
-    from asgiref.wsgi import WsgiToAsgi
-    asgi_app = WsgiToAsgi(app)
-    import uvicorn
-    uvicorn.run(asgi_app, host="0.0.0.0", port=3333)
+    bot.run(host="127.0.0.1", port=3333)

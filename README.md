@@ -27,6 +27,15 @@
 - `TELEGRAM_TARGET_CHAT_ID` — ID чата/канала для уведомлений (например, `-100...`).
 - `TELEGRAM_MESSAGE_THREAD_ID` — ID темы в форуме Telegram.
 
+## Деплой на Vercel
+
+1. Установите переменные окружения в настройках проекта на Vercel:
+   - `TELEGRAM_BOT_TOKEN`
+   - `TELEGRAM_TARGET_CHAT_ID`
+   - `TELEGRAM_MESSAGE_THREAD_ID`
+2. Убедитесь, что есть `vercel.json` и `api/index.py` (уже добавлены).
+3. В Gitea обновите webhook URL на ваш домен Vercel.
+
   ## Настройка Gitea
 
 1. Создайте webhook в Gitea:
