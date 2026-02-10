@@ -5,6 +5,7 @@ from typing import Dict, Optional
 from dotenv import load_dotenv
 import asyncio
 import os
+import random
 import traceback
 
 class TelegramWebhookBot:
@@ -45,9 +46,21 @@ class TelegramWebhookBot:
         self.app.route("/", methods=["POST"])(self.webhook)
         # Health-check for platform probes
         self.app.route("/", methods=["GET"])(self.health_check)
+        # Weekly reminder endpoint (use with cron)
+        self.app.route("/weekly-reminder", methods=["GET"])(self.weekly_reminder)
 
     def health_check(self):
         return "ok", 200
+
+    def weekly_reminder(self):
+        try:
+            message = self.build_weekly_reminder_message()
+            asyncio.run(self.send_plain_message(message))
+            return jsonify({"status": "success"}), 200
+        except Exception as e:
+            print(f"Произошла ошибка при отправке напоминания: {e}")
+            traceback.print_exc()
+            return jsonify({"status": "error", "message": str(e)}), 500
 
     def run(self, host: str = "127.0.0.1", port: int = 3333):
         """Запуск сервера."""
@@ -128,6 +141,41 @@ class TelegramWebhookBot:
             print("Сообщение отправлено успешно:", {"message": message, "rep_link": rep_link})
         except Exception as e:
             print("Ошибка отправки сообщения:", e)
+
+    async def send_plain_message(self, message: str):
+        """Отправка сообщения в Telegram без кнопок."""
+        if not message:
+            print("Пустое сообщение для отправки.")
+            return
+
+        try:
+            await self.bot.send_message(
+                chat_id=self.TARGET_CHAT_ID,
+                text=message,
+                message_thread_id=self.MESSAGE_THREAD_ID
+            )
+            print("Сообщение отправлено успешно:", {"message": message})
+        except Exception as e:
+            print("Ошибка отправки сообщения:", e)
+
+    def build_weekly_reminder_message(self) -> str:
+        templates = [
+            "🔔 Пятничный чек‑ин: не забудьте заполнить отчет за прошедшую неделю.",
+            "🗓️ Финал недели: пора заполнить отчеты. Заполните, пожалуйста, форму.",
+            "✅ Последний штрих пятницы — отчет о работе за неделю. Заполните сегодня.",
+            "📌 Напоминание: отчет за прошедшую неделю ждёт вашего участия.",
+            "✍️ Пятничная рутина: внесите результаты недели в отчет.",
+            "🚀 Чтобы уйти на выходные спокойно — заполните недельный отчет.",
+            "🧾 Отчетная пятница: обновите данные о проделанной работе.",
+            "📣 Коллеги, внимание: отчет за неделю нужно заполнить сегодня.",
+            "⏳ До завершения недели осталось чуть-чуть — заполните отчет, пожалуйста.",
+            "🔍 Итоги недели: пришло время заполнить отчет.",
+        ]
+        mentions = " ".join([f"@{user['tgName']}" for user in self.arr_of_users if user.get("tgName")])
+        return (
+            f"{random.choice(templates)}\n"
+            f"{mentions}"
+        )
 
     async def process_event(self, action: str, data: Dict, main_user: Dict, repo_name: str, branch: str, rep_link: str):
         # Обработка событий
