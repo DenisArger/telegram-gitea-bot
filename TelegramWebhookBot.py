@@ -3,6 +3,7 @@ from flask import Flask, request, jsonify
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from typing import Dict, Optional
 from dotenv import load_dotenv
+import asyncio
 import os
 import traceback
 
@@ -52,7 +53,7 @@ class TelegramWebhookBot:
         """Запуск сервера."""
         self.app.run(host=host, port=port)  # Явно указываем локальный адрес (127.0.0.1)
 
-    async def webhook(self):
+    def webhook(self):
         """Обработчик входящих webhook-данных."""
         try:
             data = request.json
@@ -96,21 +97,9 @@ class TelegramWebhookBot:
                 print("Неизвестная структура данных:", data)
                 return jsonify({"status": "error", "message": "Unknown data structure"}), 400
 
-            # Обработка событий
-            if action == "assigned" and data.get("pull_request"):
-                await self.handle_assigned_event(data, main_user, repo_name, branch, rep_link)
-            elif action == "unassigned" and data.get("pull_request"):
-                await self.handle_unassigned_event(data, main_user, repo_name, branch, rep_link)
-            elif action == "review_requested":
-                await self.handle_review_requested_event(data, main_user, repo_name, branch, rep_link)
-            elif action == "review_request_removed":
-                await self.handle_review_request_removed_event(data, main_user, repo_name, branch, rep_link)
-            elif action in ["opened", "closed", "reopened", "created", "edited", "deleted"]:
-                await self.handle_generic_event(action, data, main_user, repo_name, branch, rep_link)
-            elif action == "reviewed":
-                await self.handle_reviewed_event(data, main_user, repo_name, branch, rep_link)
-            else:
-                print(f"Неизвестное действие: {action}")
+            asyncio.run(
+                self.process_event(action, data, main_user, repo_name, branch, rep_link)
+            )
 
             return jsonify({"status": "success"}), 200
 
@@ -139,6 +128,23 @@ class TelegramWebhookBot:
             print("Сообщение отправлено успешно:", {"message": message, "rep_link": rep_link})
         except Exception as e:
             print("Ошибка отправки сообщения:", e)
+
+    async def process_event(self, action: str, data: Dict, main_user: Dict, repo_name: str, branch: str, rep_link: str):
+        # Обработка событий
+        if action == "assigned" and data.get("pull_request"):
+            await self.handle_assigned_event(data, main_user, repo_name, branch, rep_link)
+        elif action == "unassigned" and data.get("pull_request"):
+            await self.handle_unassigned_event(data, main_user, repo_name, branch, rep_link)
+        elif action == "review_requested":
+            await self.handle_review_requested_event(data, main_user, repo_name, branch, rep_link)
+        elif action == "review_request_removed":
+            await self.handle_review_request_removed_event(data, main_user, repo_name, branch, rep_link)
+        elif action in ["opened", "closed", "reopened", "created", "edited", "deleted"]:
+            await self.handle_generic_event(action, data, main_user, repo_name, branch, rep_link)
+        elif action == "reviewed":
+            await self.handle_reviewed_event(data, main_user, repo_name, branch, rep_link)
+        else:
+            print(f"Неизвестное действие: {action}")
 
     async def handle_assigned_event(self, data: Dict, main_user: Dict, repo_name: str, branch: str, rep_link: str):
         """Обработка назначения рецензентов."""
