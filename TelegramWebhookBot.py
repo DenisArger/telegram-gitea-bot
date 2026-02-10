@@ -80,12 +80,17 @@ class TelegramWebhookBot:
 
             # Определение ссылки на pull request или issue
             if data.get("pull_request"):
-                rep_link = data["pull_request"]["html_url"]
-                branch = data["pull_request"]["head"]["ref"]
+                rep_link = data["pull_request"].get("html_url")
+                branch = data.get("pull_request", {}).get("head", {}).get("ref")
+                if not branch:
+                    # Some Gitea events provide a reduced pull_request object without head/ref
+                    branch = data.get("pull_request", {}).get("title") or data.get("issue", {}).get("title")
             elif data.get("issue") and data.get("comment"):
-                rep_link = data["issue"]["pull_request"]["html_url"] if data["issue"].get("pull_request") else \
-                    data["issue"]["url"]
-                branch = data["issue"]["title"]
+                if data["issue"].get("pull_request"):
+                    rep_link = data["issue"]["pull_request"].get("html_url")
+                else:
+                    rep_link = data["issue"].get("url")
+                branch = data["issue"].get("title")
 
             if not rep_link or not branch:
                 print("Неизвестная структура данных:", data)
