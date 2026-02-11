@@ -261,7 +261,16 @@ class TelegramWebhookBot:
                 print("Список запрошенных рецензентов пуст:", data)
                 return
 
+        seen_logins = set()
+        unique_reviewers = []
         for reviewer in requested_reviewers:
+            login = reviewer.get("login")
+            if not login or login in seen_logins:
+                continue
+            seen_logins.add(login)
+            unique_reviewers.append(reviewer)
+
+        for reviewer in unique_reviewers:
             reviewer_tg_name = next(
                 (user["tgName"] for user in self.arr_of_users if user["repName"] == reviewer["login"]), None)
             if reviewer_tg_name:
