@@ -197,6 +197,8 @@ class TelegramWebhookBot:
             print("Открытие PR игнорируется по настройке уведомлений.")
         elif action == "edited":
             print("Редактирование комментария (edited) игнорируется по настройке уведомлений.")
+        elif action == "updated":
+            print("Обновление комментария (updated) игнорируется по настройке уведомлений.")
         else:
             print(f"Неизвестное действие: {action}")
 
@@ -324,13 +326,6 @@ class TelegramWebhookBot:
             message = (
                 f"🔔{main_user['repName']}\n"
                 f"📝 Прокомментировал запрос на слияние #{data['pull_request']['number']}\n"
-                f"Ветка: {branch}\n"
-                f"🔔Автор ветки: @{pull_request_creator_tg_name}"
-            )
-        elif action == "edited":
-            message = (
-                f"🔔{main_user['repName']}\n"
-                f"✏️ Изменил комментарий к запросу на слияние #{data['pull_request']['number']}\n"
                 f"Ветка: {branch}\n"
                 f"🔔Автор ветки: @{pull_request_creator_tg_name}"
             )
