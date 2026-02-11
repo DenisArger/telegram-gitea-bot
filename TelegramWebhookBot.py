@@ -185,7 +185,7 @@ class TelegramWebhookBot:
             await self.handle_review_requested_event(data, main_user, repo_name, branch, rep_link)
         elif action == "review_request_removed":
             await self.handle_review_request_removed_event(data, main_user, repo_name, branch, rep_link)
-        elif action in ["closed", "reopened", "created", "edited", "deleted"]:
+        elif action in ["closed", "reopened", "created", "deleted"]:
             await self.handle_generic_event(action, data, main_user, repo_name, branch, rep_link)
         elif action == "reviewed":
             await self.handle_reviewed_event(data, main_user, repo_name, branch, rep_link)
@@ -195,6 +195,8 @@ class TelegramWebhookBot:
             print("Снятие рецензентов (unassigned) игнорируется по настройке уведомлений.")
         elif action == "opened":
             print("Открытие PR игнорируется по настройке уведомлений.")
+        elif action == "edited":
+            print("Редактирование комментария (edited) игнорируется по настройке уведомлений.")
         else:
             print(f"Неизвестное действие: {action}")
 
