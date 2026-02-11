@@ -181,18 +181,20 @@ class TelegramWebhookBot:
 
     async def process_event(self, action: str, data: Dict, main_user: Dict, repo_name: str, branch: str, rep_link: str):
         # Обработка событий
-        if action == "assigned" and data.get("pull_request"):
-            await self.handle_assigned_event(data, main_user, repo_name, branch, rep_link)
-        elif action == "unassigned" and data.get("pull_request"):
-            await self.handle_unassigned_event(data, main_user, repo_name, branch, rep_link)
-        elif action == "review_requested":
+        if action == "review_requested":
             await self.handle_review_requested_event(data, main_user, repo_name, branch, rep_link)
         elif action == "review_request_removed":
             await self.handle_review_request_removed_event(data, main_user, repo_name, branch, rep_link)
-        elif action in ["opened", "closed", "reopened", "created", "edited", "deleted"]:
+        elif action in ["closed", "reopened", "created", "edited", "deleted"]:
             await self.handle_generic_event(action, data, main_user, repo_name, branch, rep_link)
         elif action == "reviewed":
             await self.handle_reviewed_event(data, main_user, repo_name, branch, rep_link)
+        elif action == "assigned":
+            print("Назначение рецензентов (assigned) игнорируется по настройке уведомлений.")
+        elif action == "unassigned":
+            print("Снятие рецензентов (unassigned) игнорируется по настройке уведомлений.")
+        elif action == "opened":
+            print("Открытие PR игнорируется по настройке уведомлений.")
         else:
             print(f"Неизвестное действие: {action}")
 
@@ -296,14 +298,7 @@ class TelegramWebhookBot:
             "Неизвестный"
         )
 
-        if action == "opened":
-            message = (
-
-                f"🔔{main_user['repName']}\n"
-                f"🚀 Создал запрос на слияние #{data['pull_request']['number']}\n"
-                f"Ветка: {branch}"
-            )
-        elif action == "closed":
+        if action == "closed":
             is_merged = data.get("pull_request", {}).get("merged", False)
             if is_merged:
                 message = (
