@@ -256,12 +256,12 @@ class TelegramWebhookBot:
 
     async def handle_review_requested_event(self, data: Dict, main_user: Dict, repo_name: str, branch: str, rep_link: str):
         """Обработка запроса на проверку."""
-        requested_reviewers = data.get("pull_request", {}).get("requested_reviewers", [])
-        if not requested_reviewers:
-            single_reviewer = data.get("requested_reviewer")
-            if single_reviewer:
-                requested_reviewers = [single_reviewer]
-            else:
+        single_reviewer = data.get("requested_reviewer")
+        if single_reviewer:
+            requested_reviewers = [single_reviewer]
+        else:
+            requested_reviewers = data.get("pull_request", {}).get("requested_reviewers", [])
+            if not requested_reviewers:
                 print("Список запрошенных рецензентов пуст:", data)
                 return
 
