@@ -189,7 +189,7 @@ class TelegramWebhookBot:
             await self.handle_review_requested_event(data, main_user, repo_name, branch, rep_link)
         elif action == "review_request_removed":
             await self.handle_review_request_removed_event(data, main_user, repo_name, branch, rep_link)
-        elif action in ["closed", "reopened", "created", "deleted"]:
+        elif action in ["closed", "reopened", "created", "deleted", "synchronized"]:
             await self.handle_generic_event(action, data, main_user, repo_name, branch, rep_link)
         elif action == "reviewed":
             await self.handle_reviewed_event(data, main_user, repo_name, branch, rep_link)
@@ -308,7 +308,7 @@ class TelegramWebhookBot:
 
     async def handle_generic_event(self, action: str, data: Dict, main_user: Dict, repo_name: str, branch: str,
                                    rep_link: str):
-        """Обработка общих событий (opened, closed, reopened, created, edited, deleted)."""
+        """Обработка общих событий (opened, closed, reopened, created, edited, deleted, synchronized)."""
         pull_request_creator_name = data.get("pull_request", {}).get("user", {}).get("login")
         pull_request_creator_tg_name = next(
             (user["tgName"] for user in self.arr_of_users if user["repName"] == pull_request_creator_name),
@@ -339,6 +339,13 @@ class TelegramWebhookBot:
             message = (
                 f"🔔{main_user['repName']}\n"
                 f"📝 Прокомментировал запрос на слияние #{data['pull_request']['number']}\n"
+                f"Ветка: {branch}\n"
+                f"🔔Автор ветки: @{pull_request_creator_tg_name}"
+            )
+        elif action == "synchronized":
+            message = (
+                f"🔔{main_user['repName']}\n"
+                f"🔄 Обновил ветку PR #{data['pull_request']['number']} новыми коммитами\n"
                 f"Ветка: {branch}\n"
                 f"🔔Автор ветки: @{pull_request_creator_tg_name}"
             )
