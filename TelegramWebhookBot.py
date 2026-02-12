@@ -343,11 +343,26 @@ class TelegramWebhookBot:
                 f"🔔Автор ветки: @{pull_request_creator_tg_name}"
             )
         elif action == "synchronized":
+            requested_reviewers = data.get("pull_request", {}).get("requested_reviewers", [])
+            reviewer_mentions = []
+            seen_reviewers = set()
+            for reviewer in requested_reviewers:
+                reviewer_login = reviewer.get("login")
+                if not reviewer_login or reviewer_login == main_user["repName"] or reviewer_login in seen_reviewers:
+                    continue
+                seen_reviewers.add(reviewer_login)
+                reviewer_tg_name = next(
+                    (user["tgName"] for user in self.arr_of_users if user["repName"] == reviewer_login), None
+                )
+                if reviewer_tg_name:
+                    reviewer_mentions.append(f"@{reviewer_tg_name}")
+
+            reviewers_line = " ".join(reviewer_mentions) if reviewer_mentions else "не найдены"
             message = (
                 f"🔔{main_user['repName']}\n"
-                f"🔄 Обновил ветку PR #{data['pull_request']['number']} новыми коммитами\n"
+                f"🔄 Проверьте повторно PR #{data['pull_request']['number']}\n"
                 f"Ветка: {branch}\n"
-                f"🔔Автор ветки: @{pull_request_creator_tg_name}"
+                f"🔔Рецензенты: {reviewers_line}"
             )
         else:
             print(f"Неизвестное действие: {action}")
