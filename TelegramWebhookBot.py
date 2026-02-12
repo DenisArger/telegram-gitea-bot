@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import random
+import time
 import traceback
 
 class TelegramWebhookBot:
@@ -28,6 +29,9 @@ class TelegramWebhookBot:
 
         # Массив пользователей (сопоставление имен из Gitea с Telegram)
         self.arr_of_users = self.load_users()
+        # Throttle for review comment notifications: key -> next_allowed_epoch
+        self.review_comment_throttle: Dict[str, float] = {}
+        self.review_comment_interval_seconds = 30 * 60
 
         # Инициализация Flask и Telegram Bot
         self.app = Flask(__name__)
@@ -347,16 +351,33 @@ class TelegramWebhookBot:
     async def handle_reviewed_event(self, data: Dict, main_user: Dict, repo_name: str, branch: str, rep_link: str):
         """Обработка отзыва."""
         review = data.get("review", {})
-        review_type = review.get("type")
-        if not review_type:
-            print("Отзыв не содержит типа (type):", review)
+        raw_type = review.get("type") or review.get("state")
+        if not raw_type:
+            print("Отзыв не содержит типа (type/state):", review)
             message = (
                 f"🔔 @{main_user['tgName']}\n"
-                f"⚠️ Ошибка: Отзыв не содержит типа (type) для запроса на слияние #{data['pull_request']['number']}\n"
+                f"⚠️ Ошибка: Отзыв не содержит типа (type/state) для запроса на слияние #{data['pull_request']['number']}\n"
                 f"Ветка: {branch}"
             )
             await self.send_telegram_message(message, rep_link)
             return
+        review_type = str(raw_type).lower()
+        if review_type in {"pull_request_review_comment"}:
+            review_type = "pull_request_review_comment"
+        elif review_type in {"pull_request_review_commented", "comment", "commented"}:
+            review_type = "pull_request_review_commented"
+        elif review_type in {"pull_request_review_approved", "approved", "approve"}:
+            review_type = "pull_request_review_approved"
+        elif review_type in {
+            "pull_request_review_rejected",
+            "pull_request_review_request_changes",
+            "request_changes",
+            "changes_requested",
+            "rejected",
+        }:
+            review_type = "pull_request_review_rejected"
+        elif review_type in {"pull_request_comment"}:
+            review_type = "pull_request_comment"
 
         pull_request_creator_name = data.get("pull_request", {}).get("user", {}).get("login")
         pull_request_creator_tg_name = next(
@@ -394,6 +415,22 @@ class TelegramWebhookBot:
                 f"📝 Добавил комментарий к запросу на слияние #{data['pull_request']['number']}\n"
                 f"Ветка: {branch}\n"
                 f"Комментарий: '{review_comment}'\n"
+                f"🔔Автор ветки: @{pull_request_creator_tg_name}"
+            )
+        elif review_type == "pull_request_review_comment":
+            author_login = data.get("sender", {}).get("login") or main_user.get("repName")
+            pr_number = data.get("pull_request", {}).get("number")
+            throttle_key = f"{author_login}:{pr_number}"
+            now = time.time()
+            next_allowed = self.review_comment_throttle.get(throttle_key, 0)
+            if now < next_allowed:
+                print(f"Пропуск уведомления по лимиту: {throttle_key}")
+                return
+            self.review_comment_throttle[throttle_key] = now + self.review_comment_interval_seconds
+            message = (
+                f"🔔{main_user['repName']}\n"
+                f"📝 Есть новые комментарии к PR #{pr_number}\n"
+                f"Ветка: {branch}\n"
                 f"🔔Автор ветки: @{pull_request_creator_tg_name}"
             )
         else:
