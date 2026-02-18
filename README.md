@@ -36,20 +36,24 @@
 2. Убедитесь, что есть `vercel.json` и `api/index.py` (уже добавлены).
 3. В Gitea обновите webhook URL на ваш домен Vercel.
 
-  ## Настройка Gitea
+## Настройка Gitea
 
-1. Создайте webhook в Gitea:
-   - Перейдите в настройки репозитория в Gitea.
-   - Добавьте новый webhook с URL вашего сервера (например, `http://your-domain.com/`).
-   - Выберите тип контента `application/json`.
-   - Укажите события, которые должны вызывать webhook (например, pull requests, issues).
+1. Создайте webhook в Gitea.
+2. Укажите URL вашего сервера (например, `https://your-domain.com/`).
+3. Выберите `application/json`.
+4. Включите нужные события (`pull_request`, `issue_comment` и другие по вашему процессу).
 
-   ## Установка
+## Локальный запуск
 
-   - git clone http://172.18.56.92:3000/NikitaHalukh/telegram_bot
-   - перейти в котолог проекта
-   - python TelegramWebhookBot.py или python3 TelegramWebhookBot.py
-   
-## На момент написания Readme файла не исправен
-    Необходимо настроить мост между ботом и сервисом Gitea
-    При необходимости добавления новых пользователей, достаточно дополнить массив пользователей rr_of_users
+```bash
+git clone https://github.com/DenisArger/telegram-gitea-bot.git
+cd telegram-gitea-bot
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python TelegramWebhookBot.py
+```
+
+## Примечание по пользователям
+
+Для добавления новых соответствий Gitea ↔ Telegram обновите файл `users.json`.

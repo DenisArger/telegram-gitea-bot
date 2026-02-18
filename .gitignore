@@ -1,1 +1,7 @@
 .env
+.idea/
+.vscode/
+traceback
+uvicorn
+__pycache__/
+*.pyc
