@@ -177,7 +177,13 @@ class TelegramWebhookBot:
             "⏳ До завершения недели осталось чуть-чуть — заполните отчет, пожалуйста.",
             "🔍 Итоги недели: пришло время заполнить отчет.",
         ]
-        mentions = " ".join([f"@{user['tgName']}" for user in self.arr_of_users if user.get("tgName")])
+        mentions = " ".join(
+            [
+                f"@{user['tgName']}"
+                for user in self.arr_of_users
+                if user.get("tgName") and user["tgName"] != "Denis_Arger"
+            ]
+        )
         return (
             f"{random.choice(templates)}\n"
             f"{mentions}"

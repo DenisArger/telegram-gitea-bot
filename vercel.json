@@ -7,6 +7,6 @@
     { "src": "/(.*)", "dest": "api/index.py" }
   ],
   "crons": [
-    { "path": "/weekly-reminder", "schedule": "30 12 * * 5" }
+    { "path": "/weekly-reminder", "schedule": "0 12 * * 5" }
   ]
 }
