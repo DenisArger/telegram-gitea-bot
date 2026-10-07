@@ -428,11 +428,11 @@ class TelegramWebhookBot:
         if action == "closed":
             is_merged = data.get("pull_request", {}).get("merged", False)
             if is_merged:
-                text = self._build(f"✅ PR #{pr_number} ({url}) ({repo}) слился", data, repo, url, [actor])
+                text = self._build(f"✅ PR #{pr_number} ({url}) ({repo}) слит", data, repo, url, [actor])
             else:
-                text = self._build(f"❌ PR #{pr_number} ({url}) ({repo}) закрыт(а)", data, repo, url, [actor])
+                text = self._build(f"❌ PR #{pr_number} ({url}) ({repo}) закрыт", data, repo, url, [actor])
         elif action == "reopened":
-            text = self._build(f"🔄 PR #{pr_number} ({url}) ({repo}) переоткрыт(а)", data, repo, url, [actor])
+            text = self._build(f"🔄 PR #{pr_number} ({url}) ({repo}) переоткрыт", data, repo, url, [actor])
         elif action == "created":
             creator_login = data.get("pull_request", {}).get("user", {}).get("login")
             creator_tg = self._tg_name(creator_login)
@@ -442,7 +442,7 @@ class TelegramWebhookBot:
             mentions = self._reviewer_mentions(data, exclude=main_user.get("repName"))
             text = self._build(f"🔄 PR #{pr_number} ({url}) ({repo}) обновлён", data, repo, url, [actor] + mentions)
         elif action == "deleted":
-            text = self._build(f"🗑️ PR #{pr_number} ({url}) ({repo}) удалён(а)", data, repo, url, [actor])
+            text = self._build(f"🗑️ PR #{pr_number} ({url}) ({repo}) удалён", data, repo, url, [actor])
         else:
             logger.warning("Unknown generic action: %s", action)
             return
@@ -462,7 +462,7 @@ class TelegramWebhookBot:
         if review_type == "pull_request_review_approved":
             text = self._build(f"✅ PR #{pr_number} ({url}) ({repo}) одобрен", data, repo, url, [actor])
         elif review_type == "pull_request_review_commented":
-            text = self._build(f"💬 PR #{pr_number} ({url}) ({repo}) комментарий", data, repo, url, [actor])
+            text = self._build(f"💬 PR #{pr_number} ({url}) ({repo}) оставлен комментарий", data, repo, url, [actor])
         elif review_type == "pull_request_review_rejected":
             comment = self._truncate_comment(review.get("content"))
             text = self._build(f"❌ PR #{pr_number} ({url}) ({repo}) отклонён", data, repo, url, [actor])
@@ -470,13 +470,13 @@ class TelegramWebhookBot:
                 text += f"\n{comment}"
         elif review_type == "pull_request_comment":
             comment = self._truncate_comment(review.get("content"))
-            text = self._build(f"💬 PR #{pr_number} ({url}) ({repo}) комментарий", data, repo, url, [actor])
+            text = self._build(f"💬 PR #{pr_number} ({url}) ({repo}) оставлен комментарий", data, repo, url, [actor])
             if comment:
                 text += f"\n{comment}"
         elif review_type == "pull_request_review_comment":
             author_login = data.get("sender", {}).get("login") or main_user.get("repName")
             throttle_key = f"{author_login}:{pr_number}"
-            text = self._build(f"📝 PR #{pr_number} ({url}) ({repo}) новые комментарии", data, repo, url, [actor])
+            text = self._build(f"📝 PR #{pr_number} ({url}) ({repo}) есть новые комментарии", data, repo, url, [actor])
             await self.deliver(Notification(text=text, rep_link=rep_link, throttle_key=throttle_key))
             return
         else:
