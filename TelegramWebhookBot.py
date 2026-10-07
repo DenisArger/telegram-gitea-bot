@@ -333,7 +333,6 @@ class TelegramWebhookBot:
             "deleted": self.handle_generic_event,
             "synchronized": self.handle_generic_event,
             "reviewed": self.handle_reviewed_event,
-            "assigned": self.handle_assigned_event,
             "unassigned": self.handle_unassigned_event,
         }
         handler = handlers.get(action)
@@ -341,28 +340,6 @@ class TelegramWebhookBot:
             logger.info("Event ignored by configuration: %s", action)
             return
         await handler(action, data, main_user, repo_name, branch, rep_link)
-
-    async def handle_assigned_event(self, action, data, main_user, repo_name, branch, rep_link):
-        """Назначение ответственных — одно сообщение на всех."""
-        assignees = data.get("pull_request", {}).get("assignees", [])
-        mentions = []
-        seen = set()
-        for assignee in assignees:
-            login = assignee.get("login") if isinstance(assignee, dict) else assignee
-            if not login or login == main_user.get("repName") or login in seen:
-                continue
-            seen.add(login)
-            tg = self._tg_name(login)
-            if tg:
-                mentions.append(tg)
-        if not mentions:
-            logger.info("No new assignees to notify")
-            return
-        text = (
-            f"🔔 {self._mentions_str(mentions)}\n"
-            f"🫡 Проверьте PR #{self._pr_number(data)} ({rep_link}) ({repo_name})"
-        )
-        await self.deliver(Notification(text=text, rep_link=rep_link))
 
     async def handle_unassigned_event(self, action, data, main_user, repo_name, branch, rep_link):
         """Снятие ответственных/рецензентов."""
