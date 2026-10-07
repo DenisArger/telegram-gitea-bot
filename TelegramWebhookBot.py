@@ -464,15 +464,9 @@ class TelegramWebhookBot:
         elif review_type == "pull_request_review_commented":
             text = self._build(f"💬 PR #{pr_number} ({url}) ({repo}) оставлен комментарий", data, repo, url, [actor])
         elif review_type == "pull_request_review_rejected":
-            comment = self._truncate_comment(review.get("content"))
             text = self._build(f"❌ PR #{pr_number} ({url}) ({repo}) отклонён", data, repo, url, [actor])
-            if comment:
-                text += f"\n{comment}"
         elif review_type == "pull_request_comment":
-            comment = self._truncate_comment(review.get("content"))
             text = self._build(f"💬 PR #{pr_number} ({url}) ({repo}) оставлен комментарий", data, repo, url, [actor])
-            if comment:
-                text += f"\n{comment}"
         elif review_type == "pull_request_review_comment":
             author_login = data.get("sender", {}).get("login") or main_user.get("repName")
             throttle_key = f"{author_login}:{pr_number}"
