@@ -20,8 +20,10 @@ import os
 import random
 import re
 import time
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
@@ -82,10 +84,22 @@ class TelegramWebhookBot:
         exclude_raw = os.getenv("WEEKLY_REMINDER_EXCLUDE", "")
         self._weekly_exclude = {s.strip() for s in exclude_raw.split(",") if s.strip()}
 
+        # Gitea API (для напоминаний о непроверенных ревью)
+        self.gitea_url = os.getenv("GITEA_URL", "").rstrip("/")
+        self.gitea_token = os.getenv("GITEA_TOKEN", "")
+        repos_raw = os.getenv("GITEA_REPOSITORIES", "")
+        self.gitea_repositories = [r.strip() for r in repos_raw.split(",") if r.strip()]
+        try:
+            self.review_reminder_hours = float(os.getenv("GITEA_REVIEW_REMINDER_HOURS", "24"))
+        except (TypeError, ValueError):
+            self.review_reminder_hours = 24.0
+        self.review_reminder_threshold = self.review_reminder_hours * 3600
+
         self.app = Flask(__name__)
         self.app.route("/", methods=["POST"])(self.webhook)
         self.app.route("/", methods=["GET"])(self.health_check)
         self.app.route("/weekly-reminder", methods=["GET"])(self.weekly_reminder)
+        self.app.route("/review-reminder", methods=["GET"])(self.review_reminder)
 
     def load_users(self) -> List[Dict]:
         """Load users from users.json"""
@@ -169,6 +183,15 @@ class TelegramWebhookBot:
             logger.exception("Weekly reminder failed")
             return jsonify({"status": "error", "message": "Internal error"}), 500
 
+    def review_reminder(self):
+        """Крон: проверяет непроверенные PR и шлёт напоминания."""
+        try:
+            asyncio.run(self.send_review_reminders())
+            return jsonify({"status": "success"}), 200
+        except Exception:
+            logger.exception("Review reminder failed")
+            return jsonify({"status": "error", "message": "Internal error"}), 500
+
     def run(self, host: str = "127.0.0.1", port: int = 3333):
         """Запуск сервера."""
         self.app.run(host=host, port=port)
@@ -187,6 +210,122 @@ class TelegramWebhookBot:
             self.WEBHOOK_SECRET.encode("utf-8"), raw_body, hashlib.sha256
         ).hexdigest()
         return hmac.compare_digest(expected, sig)
+
+    # ------------------------------------------------------------------ #
+    # Gitea API client (stateless — метки хранятся в комментариях PR)
+    # ------------------------------------------------------------------ #
+    def _gitea_request(self, method: str, path: str, **kwargs) -> Optional[Dict]:
+        if not self.gitea_url or not self.gitea_token:
+            logger.warning("Gitea API not configured (GITEA_URL/GITEA_TOKEN)")
+            return None
+        url = f"{self.gitea_url}/api/v1{path}"
+        headers = {"Authorization": f"token {self.gitea_token}"}
+        try:
+            resp = requests.request(method, url, headers=headers, timeout=15, **kwargs)
+            if resp.status_code in (200, 201):
+                return resp.json()
+            if resp.status_code == 404:
+                # Репозиторий/PR недоступен — пропускаем без паники
+                logger.debug("Gitea API 404: %s %s", method, path)
+                return None
+            logger.error("Gitea API %s %s -> %s %s", method, path,
+                         resp.status_code, resp.text[:200])
+            return None
+        except Exception:
+            logger.exception("Gitea API request failed: %s %s", method, path)
+            return None
+
+    def _gitea_list_open_prs(self, owner: str, repo: str) -> List[Dict]:
+        prs = []
+        page = 1
+        while True:
+            data = self._gitea_request(
+                "GET",
+                f"/repos/{owner}/{repo}/pulls",
+                params={"state": "open", "page": page, "per_page": 50},
+            )
+            if not data:
+                break
+            prs.extend(data)
+            if len(data) < 50:
+                break
+            page += 1
+        return prs
+
+    def _gitea_get_pr(self, owner: str, repo: str, number: int) -> Optional[Dict]:
+        return self._gitea_request("GET", f"/repos/{owner}/{repo}/pulls/{number}")
+
+    def _gitea_get_pr_reviews(self, owner: str, repo: str, number: int) -> List[Dict]:
+        data = self._gitea_request(
+            "GET", f"/repos/{owner}/{repo}/pulls/{number}/reviews"
+        )
+        return data or []
+
+    def _gitea_get_pr_comments(self, owner: str, repo: str, number: int) -> List[Dict]:
+        # Gitea хранит комментарии PR через issues API
+        data = self._gitea_request(
+            "GET", f"/repos/{owner}/{repo}/issues/{number}/comments"
+        )
+        return data or []
+
+    def _gitea_post_comment(self, owner: str, repo: str, number: int, body: str) -> bool:
+        # Gitea: комментарии к PR пишутся через issues API
+        data = self._gitea_request(
+            "POST",
+            f"/repos/{owner}/{repo}/issues/{number}/comments",
+            json={"body": body},
+        )
+        return data is not None
+
+    def _pr_is_reviewed(self, pr: Dict) -> bool:
+        """Проверяет, оставлен ли рецензент комментарий/одобрение/отклонение
+        или запрошены правки (changes_requested)."""
+        state = (pr.get("state") or "").lower()
+        if state in ("approved", "changes_requested", "rejected", "commented"):
+            return True
+        # Fallback — проверяем наличие review-объектов
+        return False
+
+    def _pr_has_reminder_marker(self, comments: List[Dict]) -> bool:
+        """Проверяет, есть ли в комментариях метка о том, что напоминание уже отправлялось."""
+        for c in comments:
+            body = c.get("body", "") or ""
+            if "review-reminder-sent" in body:
+                return True
+        return False
+
+    def _extract_owner_repo(self, full_name: str) -> Optional[tuple]:
+        parts = full_name.split("/")
+        if len(parts) == 2:
+            return parts[0], parts[1]
+        return None
+
+    def _gitea_list_all_repos(self) -> List[str]:
+        """Возвращает список 'owner/repo' для всех репозиториев, доступных токену.
+
+        Использует /repos/search, так как /user/repos требует scope read:user,
+        который может быть недоступен. Ответ имеет обёртку {"ok": true, "data": [...]}.
+        """
+        repos: List[str] = []
+        page = 1
+        while True:
+            data = self._gitea_request(
+                "GET", "/repos/search",
+                params={"page": page, "per_page": 50},
+            )
+            if not data:
+                break
+            items = data.get("data") if isinstance(data, dict) else data
+            if not items:
+                break
+            for r in items:
+                full = r.get("full_name")
+                if full and "/" in full:
+                    repos.append(full)
+            if len(items) < 50:
+                break
+            page += 1
+        return repos
 
     # ------------------------------------------------------------------ #
     # Delivery — единственный путь отправки, единый шаблон клавиатуры
@@ -230,6 +369,123 @@ class TelegramWebhookBot:
             logger.warning("Empty message for send_plain_message")
             return False
         return await self.deliver(Notification(text=message, with_keyboard=False))
+
+    # ------------------------------------------------------------------ #
+    # Review reminder (Gitea API + крон)
+    # ------------------------------------------------------------------ #
+    async def send_review_reminders(self) -> None:
+        """Проверяет непроверенные PR через Gitea API и шлёт напоминания.
+
+        Логика:
+        - Игнорируем выходные (суббота/воскресенье).
+        - Для каждого open PR без ревью старше `review_reminder_threshold`
+          шлём напоминание рецензентам.
+        - Метка `<!-- review-reminder-sent -->` добавляется в комментарий PR,
+          чтобы не спамить повторно.
+        """
+        if not self.gitea_repositories:
+            logger.info("GITEA_REPOSITORIES not set — skipping review reminder")
+            return
+
+        now = datetime.now(timezone.utc)
+        if now.weekday() >= 5:  # 5=суббота, 6=воскресенье (UTC)
+            logger.info("Skipping review reminder on weekend")
+            return
+
+        # Если список репозиториев пуст или задан ALL — получаем все доступные
+        repos = self.gitea_repositories
+        if not repos or repos == ["ALL"]:
+            repos = self._gitea_list_all_repos()
+            if not repos:
+                logger.warning("No repositories found via Gitea API")
+                return
+
+        for full_name in repos:
+            parsed = self._extract_owner_repo(full_name)
+            if not parsed:
+                logger.warning("Invalid repository format: %s", full_name)
+                continue
+            owner, repo = parsed
+            await self._check_repository(owner, repo)
+
+    async def _check_repository(self, owner: str, repo: str) -> None:
+        prs = self._gitea_list_open_prs(owner, repo)
+        for pr in prs:
+            try:
+                await self._check_pr(owner, repo, pr)
+            except Exception:
+                logger.exception("Failed to check PR #%s in %s/%s",
+                                 pr.get("number"), owner, repo)
+
+    async def _check_pr(self, owner: str, repo: str, pr: Dict) -> None:
+        number = pr.get("number")
+        if not number:
+            return
+
+        # Уже отправляли напоминание?
+        comments = self._gitea_get_pr_comments(owner, repo, number)
+        if self._pr_has_reminder_marker(comments):
+            return
+
+        # PR должен быть в состоянии ожидания ревью
+        state = (pr.get("state") or "").lower()
+        if state != "open":
+            return
+
+        # Проверяем, есть ли ревью
+        reviews = self._gitea_get_pr_reviews(owner, repo, number)
+        has_review = any(
+            (r.get("state") or "").lower() in ("approved", "changes_requested", "rejected", "commented")
+            for r in reviews
+        )
+        if has_review:
+            return
+
+        # Проверяем, что PR старше порога
+        created_at = pr.get("created_at")
+        if not created_at:
+            return
+        try:
+            created_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        except Exception:
+            logger.warning("Cannot parse created_at: %s", created_at)
+            return
+
+        now = datetime.now(created_dt.tzinfo) if created_dt.tzinfo else datetime.now()
+        age = (now - created_dt).total_seconds()
+        if age < self.review_reminder_threshold:
+            return
+
+        # Шлём напоминание
+        await self._send_review_reminder(owner, repo, pr, number)
+
+    async def _send_review_reminder(self, owner: str, repo: str, pr: Dict, number: int) -> None:
+        reviewers = pr.get("requested_reviewers") or []
+        mentions = []
+        for r in reviewers:
+            login = r.get("login") if isinstance(r, dict) else r
+            tg = self._tg_name(login)
+            if tg:
+                mentions.append(tg)
+
+        if not mentions:
+            logger.info("No known reviewers for PR #%s in %s/%s", number, owner, repo)
+            return
+
+        url = pr.get("html_url") or f"{self.gitea_url}/{owner}/{repo}/pull/{number}"
+        text = (
+            f"🔔 {self._mentions_str(mentions)}\n"
+            f"⏰ Напоминание: PR <a href=\"{url}\">#{number}</a> ({owner}/{repo}) "
+            f"ожидает ревью более {self.review_reminder_hours:g} ч."
+        )
+        await self.deliver(Notification(text=text, rep_link=url))
+
+        # Добавляем метку в комментарий, чтобы больше не напоминать
+        marker_body = (
+            "<!-- review-reminder-sent -->\n"
+            f"Напоминание о непроверенном PR #{number} отправлено в Telegram."
+        )
+        self._gitea_post_comment(owner, repo, number, marker_body)
 
     def _maybe_evict_throttle(self, now: float) -> None:
         self._throttle_evict_counter += 1

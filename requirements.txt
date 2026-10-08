@@ -1,3 +1,4 @@
 Flask[async]==2.2.5
 python-telegram-bot==20.0
 python-dotenv==0.21.1
+requests==2.31.0
