@@ -727,6 +727,8 @@ async def handle_review_requested_event(self, action, data, main_user, repo_name
         raw_type = review.get("type") or review.get("state")
         review_type = self._normalize_review_type(raw_type)
 
+        logger.info("Review event: raw_type=%r review_type=%r review=%s", raw_type, review_type, review)
+
         url = rep_link
         repo = repo_name
 
