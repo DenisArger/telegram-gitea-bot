@@ -640,7 +640,7 @@ class TelegramWebhookBot:
         )
         await self.deliver(Notification(text=text, rep_link=rep_link))
 
-async def handle_review_requested_event(self, action, data, main_user, repo_name, branch, rep_link):
+    async def handle_review_requested_event(self, action, data, main_user, repo_name, branch, rep_link):
         """Запрос на проверку — одно сообщение на всех рецензентов."""
         # Suppress if recent synchronized for same PR
         pr_key = f"{repo_name}#{self._pr_number(data)}"
