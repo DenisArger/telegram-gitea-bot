@@ -215,6 +215,7 @@ class TelegramWebhookBot:
                 await bot.send_message(
                     chat_id=self.TARGET_CHAT_ID,
                     text=notification.text,
+                    parse_mode="HTML",
                     reply_markup=keyboard,
                     message_thread_id=self.MESSAGE_THREAD_ID,
                 )
@@ -285,12 +286,17 @@ class TelegramWebhookBot:
             return f"@{tg}"
         return user.get("repName") or "Кто-то"
 
-    # ------------------------------------------------------------------ #
-    # Единый билдер: "ACTION PR #N (url) (repo)  🔔 @mentions"
+# ------------------------------------------------------------------ #
+    # Единый билдер: "ACTION PR #N (repo)  🔔 @mentions"  #N — ссылка
     # ------------------------------------------------------------------ #
     def _build(self, action_text: str, data: Dict, repo: str, url: str,
                mentions: Optional[List[str]] = None) -> str:
-        head = f"{action_text} PR #{self._pr_number(data)} ({url}) ({repo})"
+        pr_num = self._pr_number(data)
+        if url:
+            pr_link = f'<a href="{url}">#{pr_num}</a>'
+        else:
+            pr_link = f'#{pr_num}'
+        head = f"{action_text} PR {pr_link} ({repo})"
         if mentions:
             return f"{head}  🔔 {self._mentions_str(mentions)}"
         return head
@@ -364,7 +370,7 @@ class TelegramWebhookBot:
         actor = self._actor_mention(main_user)
         text = (
             f"❌ {actor} убрал(а) {self._mentions_str(mentions)} "
-            f"с PR #{self._pr_number(data)} ({rep_link}) ({repo_name})"
+            f"с PR <a href=\"{rep_link}\">#{self._pr_number(data)}</a> ({repo_name})"
         )
         await self.deliver(Notification(text=text, rep_link=rep_link))
 
@@ -378,7 +384,7 @@ class TelegramWebhookBot:
             return
         text = (
             f"🔔 {self._mentions_str(mentions)}\n"
-            f"🫡 Проверьте PR #{self._pr_number(data)} ({rep_link}) ({repo_name})"
+            f"🫡 Проверьте PR <a href=\"{rep_link}\">#{self._pr_number(data)}</a> ({repo_name})"
         )
         await self.deliver(Notification(text=text, rep_link=rep_link))
 
@@ -391,7 +397,7 @@ class TelegramWebhookBot:
             logger.warning("Removed reviewer not mapped: %s", login)
             return
         text = (
-            f"❌ Запрос на ревью отозван: PR #{self._pr_number(data)} ({rep_link}) ({repo_name})  🔔 @{tg}"
+            f"❌ Запрос на ревью отозван: PR <a href=\"{rep_link}\">#{self._pr_number(data)}</a> ({repo_name})  🔔 @{tg}"
         )
         await self.deliver(Notification(text=text, rep_link=rep_link))
 
