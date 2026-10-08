@@ -4,6 +4,6 @@
   "routes": [{ "src": "/(.*)", "dest": "api/index.py" }],
   "crons": [
     { "path": "/weekly-reminder", "schedule": "0 12 * * 5" },
-    { "path": "/review-reminder", "schedule": "0 10 * * *" }
+    { "path": "/review-reminder", "schedule": "0 7 * * *" }
   ]
 }
