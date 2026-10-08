@@ -269,7 +269,7 @@ class TelegramWebhookBot:
 
     @staticmethod
     def _mentions_str(mentions: List[str]) -> str:
-        return " ".join(f"@{m}" for m in mentions)
+        return " ".join(m if m.startswith("@") else f"@{m}" for m in mentions)
 
     @staticmethod
     def _truncate_comment(text: Optional[str]) -> str:
@@ -287,7 +287,7 @@ class TelegramWebhookBot:
         return user.get("repName") or "Кто-то"
 
 # ------------------------------------------------------------------ #
-    # Единый билдер: "ACTION PR #N (repo)  🔔 @mentions"  #N — ссылка
+    # Единый билдер: "🔔 @mentions\nACTION PR #N (repo)"  #N — ссылка
     # ------------------------------------------------------------------ #
     def _build(self, action_text: str, data: Dict, repo: str, url: str,
                mentions: Optional[List[str]] = None) -> str:
@@ -298,7 +298,7 @@ class TelegramWebhookBot:
             pr_link = f'#{pr_num}'
         head = f"{action_text} PR {pr_link} ({repo})"
         if mentions:
-            return f"{head}  🔔 {self._mentions_str(mentions)}"
+            return f"🔔 {self._mentions_str(mentions)}\n{head}"
         return head
 
     # ------------------------------------------------------------------ #
@@ -369,8 +369,8 @@ class TelegramWebhookBot:
             return
         actor = self._actor_mention(main_user)
         text = (
-            f"❌ {actor} убрал(а) {self._mentions_str(mentions)} "
-            f"с PR <a href=\"{rep_link}\">#{self._pr_number(data)}</a> ({repo_name})"
+            f"🔔 {self._mentions_str(mentions)}\n"
+            f"❌ {actor} убрал(а) с PR <a href=\"{rep_link}\">#{self._pr_number(data)}</a> ({repo_name})"
         )
         await self.deliver(Notification(text=text, rep_link=rep_link))
 
@@ -397,13 +397,12 @@ class TelegramWebhookBot:
             logger.warning("Removed reviewer not mapped: %s", login)
             return
         text = (
-            f"❌ Запрос на ревью отозван: PR <a href=\"{rep_link}\">#{self._pr_number(data)}</a> ({repo_name})  🔔 @{tg}"
+            f"❌ Запрос на ревью отозван: PR <a href=\"{rep_link}\">#{self._pr_number(data)}</a> ({repo_name})  🔔 {tg}"
         )
         await self.deliver(Notification(text=text, rep_link=rep_link))
 
     async def handle_generic_event(self, action, data, main_user, repo_name, branch, rep_link):
         """Общие события (closed, reopened, created, deleted, synchronized)."""
-        pr_number = self._pr_number(data)
         actor = self._actor_mention(main_user)
         url = rep_link
         repo = repo_name
@@ -411,21 +410,21 @@ class TelegramWebhookBot:
         if action == "closed":
             is_merged = data.get("pull_request", {}).get("merged", False)
             if is_merged:
-                text = self._build(f"✅ PR #{pr_number} ({url}) ({repo}) слит", data, repo, url, [actor])
+                text = self._build("✅ слит", data, repo, url, [actor])
             else:
-                text = self._build(f"❌ PR #{pr_number} ({url}) ({repo}) закрыт", data, repo, url, [actor])
+                text = self._build("❌ закрыт(а)", data, repo, url, [actor])
         elif action == "reopened":
-            text = self._build(f"🔄 PR #{pr_number} ({url}) ({repo}) переоткрыт", data, repo, url, [actor])
+            text = self._build("🔄 переоткрыт(а)", data, repo, url, [actor])
         elif action == "created":
             creator_login = data.get("pull_request", {}).get("user", {}).get("login")
             creator_tg = self._tg_name(creator_login)
             creator = f"@{creator_tg}" if creator_tg else "Неизвестный"
-            text = self._build(f"💬 PR #{pr_number} ({url}) ({repo}) комментарий", data, repo, url, [actor, creator])
+            text = self._build("💬 комментарий", data, repo, url, [actor, creator])
         elif action == "synchronized":
             mentions = self._reviewer_mentions(data, exclude=main_user.get("repName"))
-            text = self._build(f"🔄 PR #{pr_number} ({url}) ({repo}) обновлён", data, repo, url, [actor] + mentions)
+            text = self._build("🔄 обновлён", data, repo, url, [actor] + mentions)
         elif action == "deleted":
-            text = self._build(f"🗑️ PR #{pr_number} ({url}) ({repo}) удалён", data, repo, url, [actor])
+            text = self._build("🗑️ удалён(а)", data, repo, url, [actor])
         else:
             logger.warning("Unknown generic action: %s", action)
             return
@@ -437,30 +436,33 @@ class TelegramWebhookBot:
         raw_type = review.get("type") or review.get("state")
         review_type = self._normalize_review_type(raw_type)
 
-        pr_number = self._pr_number(data)
-        actor = self._actor_mention(main_user)
         url = rep_link
         repo = repo_name
 
+        # Тегаем автора PR, когда он проверен/одобрен/отклонён/прокомментирован
+        pr_author_login = data.get("pull_request", {}).get("user", {}).get("login")
+        pr_author_tg = self._tg_name(pr_author_login)
+        author_mention = f"@{pr_author_tg}" if pr_author_tg else (pr_author_login or "Автор PR")
+
         if review_type == "pull_request_review_approved":
-            text = self._build(f"✅ PR #{pr_number} ({url}) ({repo}) одобрен", data, repo, url, [actor])
+            text = self._build("✅ одобрен", data, repo, url, [author_mention])
         elif review_type == "pull_request_review_commented":
-            text = self._build(f"💬 PR #{pr_number} ({url}) ({repo}) оставлен комментарий", data, repo, url, [actor])
+            text = self._build("💬 оставлен комментарий", data, repo, url, [author_mention])
         elif review_type == "pull_request_review_rejected":
-            text = self._build(f"❌ PR #{pr_number} ({url}) ({repo}) отклонён", data, repo, url, [actor])
+            text = self._build("❌ отклонён", data, repo, url, [author_mention])
         elif review_type == "pull_request_comment":
-            text = self._build(f"💬 PR #{pr_number} ({url}) ({repo}) оставлен комментарий", data, repo, url, [actor])
+            text = self._build("💬 оставлен комментарий", data, repo, url, [author_mention])
         elif review_type == "pull_request_review_comment":
             author_login = data.get("sender", {}).get("login") or main_user.get("repName")
-            throttle_key = f"{author_login}:{pr_number}"
-            text = self._build(f"📝 PR #{pr_number} ({url}) ({repo}) есть новые комментарии", data, repo, url, [actor])
+            throttle_key = f"{author_login}:{self._pr_number(data)}"
+            text = self._build("📝 есть новые комментарии", data, repo, url, [author_mention])
             await self.deliver(Notification(text=text, rep_link=rep_link, throttle_key=throttle_key))
             return
         else:
             logger.warning("Unknown review type: %r (raw=%r)", review_type, raw_type)
             text = self._build(
                 f"⚠️ Неизвестный отзыв ({raw_type})",
-                data, repo, url, [actor]
+                data, repo, url, [author_mention]
             )
         await self.deliver(Notification(text=text, rep_link=rep_link))
 
