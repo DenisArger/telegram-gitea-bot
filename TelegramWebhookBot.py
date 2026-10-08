@@ -410,7 +410,7 @@ class TelegramWebhookBot:
         if action == "closed":
             is_merged = data.get("pull_request", {}).get("merged", False)
             if is_merged:
-                text = self._build("✅ слит", data, repo, url, [actor])
+                text = self._build("✅ слит", data, repo, url)
             else:
                 text = self._build("❌ закрыт(а)", data, repo, url, [actor])
         elif action == "reopened":
