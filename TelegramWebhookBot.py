@@ -82,10 +82,6 @@ class TelegramWebhookBot:
         self._throttle_interval = THROTTLE_INTERVAL_SECONDS
         self._throttle_evict_counter = 0
 
-        # Track recent synchronized events to suppress duplicate review_requested
-        self._recent_synchronized: Dict[str, float] = {}
-        self._sync_suppress_window = 120  # seconds
-
         exclude_raw = os.getenv("WEEKLY_REMINDER_EXCLUDE", "")
         self._weekly_exclude = {s.strip() for s in exclude_raw.split(",") if s.strip()}
 
@@ -642,13 +638,6 @@ class TelegramWebhookBot:
 
     async def handle_review_requested_event(self, action, data, main_user, repo_name, branch, rep_link):
         """Запрос на проверку — одно сообщение на всех рецензентов."""
-        # Suppress if recent synchronized for same PR
-        pr_key = f"{repo_name}#{self._pr_number(data)}"
-        last_sync = self._recent_synchronized.get(pr_key, 0)
-        if time.time() - last_sync < self._sync_suppress_window:
-            logger.info("Suppressed review_requested due to recent synchronized: %s", pr_key)
-            return
-
         single = data.get("requested_reviewer")
         reviewers = [single] if single else data.get("pull_request", {}).get("requested_reviewers", [])
         mentions = self._reviewer_mentions(data)
@@ -701,19 +690,8 @@ class TelegramWebhookBot:
 
             text = self._build("💬 новый комментарий", data, repo, url, mentions)
         elif action == "synchronized":
-            pr_author = data.get("pull_request", {}).get("user", {}).get("login")
-            mentions = self._reviewer_mentions(data, exclude=main_user.get("repName"))
-            if pr_author:
-                pr_author_tg = self._tg_name(pr_author)
-                mentions = [m for m in mentions
-                           if m != pr_author and m != f"@{pr_author}"
-                           and m != pr_author_tg and m != f"@{pr_author_tg}"]
-
-            # Record synchronized event to suppress review_requested
-            pr_key = f"{repo_name}#{self._pr_number(data)}"
-            self._recent_synchronized[pr_key] = time.time()
-
-            text = self._build("🔄 обновлён, проверьте повторно", data, repo, url, [actor] + mentions)
+            # Disabled: notifications only via review_requested
+            return
         elif action == "deleted":
             text = self._build("🗑️ удалён(а)", data, repo, url, [actor])
         else:
