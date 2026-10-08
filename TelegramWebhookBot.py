@@ -286,8 +286,10 @@ class TelegramWebhookBot:
         # Fallback — проверяем наличие review-объектов
         return False
 
-    def _pr_has_reminder_marker(self, comments: List[Dict]) -> bool:
+    def _pr_has_reminder_marker(self, comments: Optional[List[Dict]]) -> bool:
         """Проверяет, есть ли в комментариях метка о том, что напоминание уже отправлялось."""
+        if not comments:
+            return False
         for c in comments:
             body = c.get("body", "") or ""
             if "review-reminder-sent" in body:
@@ -311,7 +313,7 @@ class TelegramWebhookBot:
         while True:
             data = self._gitea_request(
                 "GET", "/repos/search",
-                params={"page": page, "per_page": 50},
+                params={"page": page, "limit": 50},
             )
             if not data:
                 break
@@ -432,10 +434,13 @@ class TelegramWebhookBot:
         if state != "open":
             return
 
-        # Проверяем, есть ли ревью
+        # Проверяем, есть ли ревью (комментарий/одобрение/отклонение/запрос правок)
         reviews = self._gitea_get_pr_reviews(owner, repo, number)
         has_review = any(
-            (r.get("state") or "").lower() in ("approved", "changes_requested", "rejected", "commented")
+            (r.get("state") or "").lower() in (
+                "approved", "changes_requested", "rejected", "commented",
+                "request_changes",  # Gitea возвращает REQUEST_CHANGES
+            )
             for r in reviews
         )
         if has_review:
