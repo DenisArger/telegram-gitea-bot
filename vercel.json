@@ -1,13 +1,9 @@
 {
   "version": 2,
-  "builds": [
-    { "src": "api/index.py", "use": "@vercel/python" }
-  ],
-  "routes": [
-    { "src": "/(.*)", "dest": "api/index.py" }
-  ],
+  "builds": [{ "src": "api/index.py", "use": "@vercel/python" }],
+  "routes": [{ "src": "/(.*)", "dest": "api/index.py" }],
   "crons": [
     { "path": "/weekly-reminder", "schedule": "0 12 * * 5" },
-    { "path": "/review-reminder", "schedule": "0 9 * * *" }
+    { "path": "/review-reminder", "schedule": "0 10 * * *" }
   ]
 }
