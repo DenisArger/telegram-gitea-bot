@@ -82,6 +82,10 @@ class TelegramWebhookBot:
         self._throttle_interval = THROTTLE_INTERVAL_SECONDS
         self._throttle_evict_counter = 0
 
+        # Track recent synchronized events to suppress duplicate review_requested
+        self._recent_synchronized: Dict[str, float] = {}
+        self._sync_suppress_window = 120  # seconds
+
         exclude_raw = os.getenv("WEEKLY_REMINDER_EXCLUDE", "")
         self._weekly_exclude = {s.strip() for s in exclude_raw.split(",") if s.strip()}
 
@@ -636,8 +640,15 @@ class TelegramWebhookBot:
         )
         await self.deliver(Notification(text=text, rep_link=rep_link))
 
-    async def handle_review_requested_event(self, action, data, main_user, repo_name, branch, rep_link):
+async def handle_review_requested_event(self, action, data, main_user, repo_name, branch, rep_link):
         """Запрос на проверку — одно сообщение на всех рецензентов."""
+        # Suppress if recent synchronized for same PR
+        pr_key = f"{repo_name}#{self._pr_number(data)}"
+        last_sync = self._recent_synchronized.get(pr_key, 0)
+        if time.time() - last_sync < self._sync_suppress_window:
+            logger.info("Suppressed review_requested due to recent synchronized: %s", pr_key)
+            return
+
         single = data.get("requested_reviewer")
         reviewers = [single] if single else data.get("pull_request", {}).get("requested_reviewers", [])
         mentions = self._reviewer_mentions(data)
@@ -678,13 +689,31 @@ class TelegramWebhookBot:
         elif action == "reopened":
             text = self._build("🔄 переоткрыт(а)", data, repo, url, [actor])
         elif action == "created":
-            creator_login = data.get("pull_request", {}).get("user", {}).get("login")
-            creator_tg = self._tg_name(creator_login)
-            creator = f"@{creator_tg}" if creator_tg else "Неизвестный"
-            text = self._build("💬 комментарий", data, repo, url, [actor, creator])
+            # Comment on PR: notify PR author and reviewers, NOT the commenter
+            comment_author = data.get("comment", {}).get("user", {}).get("login") or main_user.get("repName")
+            pr_author_login = data.get("pull_request", {}).get("user", {}).get("login")
+            pr_author_tg = self._tg_name(pr_author_login)
+            author_mention = f"@{pr_author_tg}" if pr_author_tg else (pr_author_login or "Автор PR")
+
+            mentions = self._reviewer_mentions(data, exclude=comment_author)
+            if pr_author_tg and pr_author_tg not in mentions and pr_author_login != comment_author:
+                mentions.append(f"@{pr_author_tg}")
+
+            text = self._build("💬 новый комментарий", data, repo, url, mentions)
         elif action == "synchronized":
+            pr_author = data.get("pull_request", {}).get("user", {}).get("login")
             mentions = self._reviewer_mentions(data, exclude=main_user.get("repName"))
-            text = self._build("🔄 обновлён", data, repo, url, [actor] + mentions)
+            if pr_author:
+                pr_author_tg = self._tg_name(pr_author)
+                mentions = [m for m in mentions
+                           if m != pr_author and m != f"@{pr_author}"
+                           and m != pr_author_tg and m != f"@{pr_author_tg}"]
+
+            # Record synchronized event to suppress review_requested
+            pr_key = f"{repo_name}#{self._pr_number(data)}"
+            self._recent_synchronized[pr_key] = time.time()
+
+            text = self._build("🔄 обновлён, проверьте повторно", data, repo, url, [actor] + mentions)
         elif action == "deleted":
             text = self._build("🗑️ удалён(а)", data, repo, url, [actor])
         else:
@@ -701,23 +730,37 @@ class TelegramWebhookBot:
         url = rep_link
         repo = repo_name
 
-        # Тегаем автора PR, когда он проверен/одобрен/отклонён/прокомментирован
+        # Comment author (sender of webhook)
+        comment_author = data.get("sender", {}).get("login") or main_user.get("repName")
+
+        # PR author
         pr_author_login = data.get("pull_request", {}).get("user", {}).get("login")
         pr_author_tg = self._tg_name(pr_author_login)
         author_mention = f"@{pr_author_tg}" if pr_author_tg else (pr_author_login or "Автор PR")
 
+        # Build mentions: PR author + reviewers (excluding comment author)
+        def build_comment_mentions() -> List[str]:
+            mentions = []
+            if pr_author_tg and pr_author_login != comment_author:
+                mentions.append(f"@{pr_author_tg}")
+            reviewers = self._reviewer_mentions(data, exclude=comment_author)
+            mentions.extend(reviewers)
+            return mentions
+
         if review_type == "pull_request_review_approved":
             text = self._build("✅ одобрен", data, repo, url, [author_mention])
         elif review_type == "pull_request_review_commented":
-            text = self._build("💬 оставлен комментарий", data, repo, url, [author_mention])
+            mentions = build_comment_mentions()
+            text = self._build("💬 оставлен комментарий", data, repo, url, mentions)
         elif review_type == "pull_request_review_rejected":
             text = self._build("❌ отклонён", data, repo, url, [author_mention])
         elif review_type == "pull_request_comment":
-            text = self._build("💬 оставлен комментарий", data, repo, url, [author_mention])
+            mentions = build_comment_mentions()
+            text = self._build("💬 оставлен комментарий", data, repo, url, mentions)
         elif review_type == "pull_request_review_comment":
-            author_login = data.get("sender", {}).get("login") or main_user.get("repName")
-            throttle_key = f"{author_login}:{self._pr_number(data)}"
-            text = self._build("📝 есть новые комментарии", data, repo, url, [author_mention])
+            throttle_key = f"{comment_author}:{self._pr_number(data)}"
+            mentions = build_comment_mentions()
+            text = self._build("📝 есть новые комментарии", data, repo, url, mentions)
             await self.deliver(Notification(text=text, rep_link=rep_link, throttle_key=throttle_key))
             return
         else:
