@@ -592,6 +592,8 @@ class TelegramWebhookBot:
     # Event routing
     # ------------------------------------------------------------------ #
     async def process_event(self, action, data, main_user, repo_name, branch, rep_link):
+        logger.info("Incoming event: action=%s repo=%s pr=%s sender=%s",
+                    action, repo_name, self._pr_number(data), main_user.get("repName"))
         handlers = {
             "review_requested": self.handle_review_requested_event,
             "review_request_removed": self.handle_review_request_removed_event,
@@ -611,6 +613,10 @@ class TelegramWebhookBot:
 
     async def handle_unassigned_event(self, action, data, main_user, repo_name, branch, rep_link):
         """Снятие ответственных/рецензентов."""
+        logger.info("unassigned: sender=%s removed_reviewers=%s removed_assignees=%s",
+                    data.get("sender", {}).get("login"),
+                    data.get("pull_request", {}).get("removed_reviewers"),
+                    data.get("pull_request", {}).get("removed_assignees"))
         removed = (
             data.get("pull_request", {}).get("removed_reviewers")
             or data.get("pull_request", {}).get("removed_assignees")
@@ -638,6 +644,12 @@ class TelegramWebhookBot:
 
     async def handle_review_requested_event(self, action, data, main_user, repo_name, branch, rep_link):
         """Запрос на проверку — одно сообщение на всех рецензентов."""
+        logger.info(
+            "review_requested: sender=%s requested_reviewer=%s reviewers=%s",
+            data.get("sender", {}).get("login"),
+            data.get("requested_reviewer"),
+            data.get("pull_request", {}).get("requested_reviewers")
+        )
         single = data.get("requested_reviewer")
         reviewers = [single] if single else data.get("pull_request", {}).get("requested_reviewers", [])
         mentions = self._reviewer_mentions(data)
@@ -652,6 +664,9 @@ class TelegramWebhookBot:
 
     async def handle_review_request_removed_event(self, action, data, main_user, repo_name, branch, rep_link):
         """Снятие запроса на ревью."""
+        logger.info("review_request_removed: sender=%s reviewer=%s",
+                    data.get("sender", {}).get("login"),
+                    data.get("requested_reviewer"))
         reviewer = data.get("requested_reviewer")
         login = reviewer.get("login") if isinstance(reviewer, dict) else reviewer
         tg = self._tg_name(login)
@@ -665,6 +680,10 @@ class TelegramWebhookBot:
 
     async def handle_generic_event(self, action, data, main_user, repo_name, branch, rep_link):
         """Общие события (closed, reopened, created, deleted, synchronized)."""
+        logger.info("generic_event: action=%s sender=%s pr_author=%s",
+                    action,
+                    data.get("sender", {}).get("login"),
+                    data.get("pull_request", {}).get("user", {}).get("login"))
         actor = self._actor_mention(main_user)
         url = rep_link
         repo = repo_name
@@ -680,6 +699,9 @@ class TelegramWebhookBot:
         elif action == "created":
             # Comment on PR: notify PR author and reviewers, NOT the commenter
             comment_author = data.get("comment", {}).get("user", {}).get("login") or main_user.get("repName")
+            comment_body = data.get("comment", {}).get("body", "")[:100]
+            logger.info("comment_created: author=%s body_preview=%r",
+                        comment_author, comment_body)
             pr_author_login = data.get("pull_request", {}).get("user", {}).get("login")
             pr_author_tg = self._tg_name(pr_author_login)
             author_mention = f"@{pr_author_tg}" if pr_author_tg else (pr_author_login or "Автор PR")
