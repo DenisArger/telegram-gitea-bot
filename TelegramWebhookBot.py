@@ -761,7 +761,10 @@ class TelegramWebhookBot:
             text = self._build("💬 оставлен комментарий", data, repo, url, mentions)
         elif review_type == "pull_request_review_comment":
             throttle_key = f"{comment_author}:{self._pr_number(data)}"
-            mentions = build_comment_mentions()
+            # Only notify PR author, not reviewers
+            mentions = []
+            if pr_author_tg and pr_author_login != comment_author:
+                mentions.append(f"@{pr_author_tg}")
             text = self._build("📝 есть новые комментарии", data, repo, url, mentions)
             await self.deliver(Notification(text=text, rep_link=rep_link, throttle_key=throttle_key))
             return
