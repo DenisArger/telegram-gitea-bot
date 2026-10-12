@@ -162,6 +162,10 @@ class TelegramWebhookBot:
                 else:
                     rep_link = data["issue"].get("url")
                 branch = data["issue"].get("title")
+            elif data.get("issue") and data.get("action") in ("opened", "closed", "reopened", "edited", "deleted"):
+                # Issue events (not PR-related) — acknowledge but don't notify
+                logger.info("Issue event '%s' received for issue #%s, ignoring", data.get("action"), data.get("issue", {}).get("number"))
+                return jsonify({"status": "success", "message": "Issue event acknowledged"}), 200
             elif data.get("ref") and data.get("commits") is not None:
                 # Push event — acknowledge but don't notify (not a PR event)
                 logger.info("Push event received for %s, ignoring", data.get("ref"))
