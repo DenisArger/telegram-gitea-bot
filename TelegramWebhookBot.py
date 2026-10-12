@@ -651,7 +651,7 @@ class TelegramWebhookBot:
         await self.deliver(Notification(text=text, rep_link=rep_link))
 
     async def handle_review_requested_event(self, action, data, main_user, repo_name, branch, rep_link):
-        """Запрос на проверку — одно сообщение на всех рецензентов."""
+        """Запрос на проверку — одно сообщение на конкретного рецензента."""
         logger.info(
             "review_requested: sender=%s requested_reviewer=%s reviewers=%s",
             data.get("sender", {}).get("login"),
@@ -659,8 +659,14 @@ class TelegramWebhookBot:
             data.get("pull_request", {}).get("requested_reviewers")
         )
         single = data.get("requested_reviewer")
-        reviewers = [single] if single else data.get("pull_request", {}).get("requested_reviewers", [])
-        mentions = self._reviewer_mentions(data)
+        if single:
+            login = single.get("login") if isinstance(single, dict) else single
+            mentions = []
+            tg = self._tg_name(login)
+            if tg:
+                mentions.append(tg)
+        else:
+            mentions = self._reviewer_mentions(data)
         if not mentions:
             logger.warning("No known reviewers for review_requested")
             return
