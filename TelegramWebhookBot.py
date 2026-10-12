@@ -162,6 +162,10 @@ class TelegramWebhookBot:
                 else:
                     rep_link = data["issue"].get("url")
                 branch = data["issue"].get("title")
+            elif data.get("ref") and data.get("commits") is not None:
+                # Push event — acknowledge but don't notify (not a PR event)
+                logger.info("Push event received for %s, ignoring", data.get("ref"))
+                return jsonify({"status": "success", "message": "Push event acknowledged"}), 200
 
             if not rep_link or not branch:
                 logger.warning("Unknown data structure: %r", data)
