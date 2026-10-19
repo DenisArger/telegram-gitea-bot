@@ -103,6 +103,8 @@ class TelegramWebhookBot:
         self.app.route("/weekly-reminder", methods=["GET"])(self.weekly_reminder)
         self.app.route("/review-reminder", methods=["GET"])(self.review_reminder)
         self.app.route("/telegram-webhook", methods=["POST"])(self.telegram_webhook)
+        self.app.route("/set-webhook", methods=["GET"])(self.set_telegram_webhook)
+        self.app.route("/get-webhook-info", methods=["GET"])(self.get_telegram_webhook_info)
 
     def load_users(self) -> List[Dict]:
         """Load users from users.json"""
@@ -224,6 +226,41 @@ class TelegramWebhookBot:
             return jsonify({"status": "ok"}), 200
         except Exception:
             logger.exception("Telegram webhook handling failed")
+            return jsonify({"status": "error", "message": "Internal error"}), 500
+
+    def set_telegram_webhook(self):
+        """Регистрирует webhook в Telegram по заданному URL.
+
+        Использование: GET /set-webhook?url=https://<хост>/telegram-webhook
+        Telegram начнёт шлить обновления (включая /check) на этот URL.
+        """
+        url = request.args.get("url")
+        if not url:
+            return jsonify({"status": "error", "message": "Missing ?url="}), 400
+
+        try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{self.TOKEN}/setWebhook",
+                json={"url": url},
+                timeout=15,
+            )
+            data = resp.json()
+            logger.info("setWebhook %s -> %s", url, data)
+            return jsonify({"status": "ok", "telegram": data}), 200
+        except Exception:
+            logger.exception("setWebhook failed")
+            return jsonify({"status": "error", "message": "Internal error"}), 500
+
+    def get_telegram_webhook_info(self):
+        """Возвращает статус webhook'а в Telegram (для отладки)."""
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{self.TOKEN}/getWebhookInfo",
+                timeout=15,
+            )
+            return jsonify(resp.json()), 200
+        except Exception:
+            logger.exception("getWebhookInfo failed")
             return jsonify({"status": "error", "message": "Internal error"}), 500
 
     def run(self, host: str = "127.0.0.1", port: int = 3333):
