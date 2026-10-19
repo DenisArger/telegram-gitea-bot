@@ -264,7 +264,15 @@ class TelegramWebhookBot:
             return jsonify({"status": "error", "message": "Internal error"}), 500
 
     def run(self, host: str = "127.0.0.1", port: int = 3333):
-        """Запуск Flask-сервера (вебхуки + /telegram-webhook)."""
+        """Запуск Flask-сервера (вебхуки + /telegram-webhook).
+
+        Для локального запуска, где Gitea доступен, можно включить polling
+        командой /check: задайте `TELEGRAM_POLLING=1`. Polling не требует
+        публичного URL (Telegram сам опрашивает бота).
+        """
+        if os.getenv("TELEGRAM_POLLING", "0") == "1":
+            self.start_telegram_listening()
+            return
         self.app.run(host=host, port=port)
 
     # ------------------------------------------------------------------ #
@@ -753,6 +761,22 @@ class TelegramWebhookBot:
             logger.exception("/check failed for %s", rep_login)
             await update.message.reply_text("Ошибка при сборе PR. Попробуйте позже.")
 
+    def start_telegram_listening(self) -> None:
+        """Запускает polling Telegram-бота (команда /check).
+
+        Используется локально, где Gitea доступен. Polling не требует
+        публичного HTTPS-URL — Telegram сам опрашивает бота по API.
+        """
+        # Python 3.7: в новом потоке event loop должен задаваться явно
+        try:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+        except RuntimeError:
+            pass
+
+        app = self._ensure_telegram_app()
+        logger.info("Telegram polling started")
+        app.run_polling()
+
     def _ensure_telegram_app(self):
         """Создаёт Telegram Application с обработчиком /check.
 
@@ -1091,4 +1115,4 @@ class TelegramWebhookBot:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     bot = TelegramWebhookBot()
-    bot.run(host="127.0.0.1", port=3333)
+    bot.run(host="0.0.0.0", port=3333)
