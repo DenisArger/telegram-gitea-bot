@@ -400,6 +400,29 @@ class TelegramWebhookBot:
             page += 1
         return repos
 
+    def _normalized_repositories(self) -> List[str]:
+        """Возвращает список 'owner/repo' или вызывает `_gitea_list_all_repos`
+        при `ALL`. Очищает значения от мусора (например, `GITEA_REPOSITORIES=ALL`
+        из сломанного .env)."""
+        repos = self.gitea_repositories
+        if not repos:
+            return self._gitea_list_all_repos()
+
+        # Нормализуем: убираем возможные `KEY=VALUE` и пустые элементы
+        cleaned = []
+        for r in repos:
+            r = (r or "").strip()
+            if not r:
+                continue
+            if "=" in r:
+                r = r.split("=", 1)[-1].strip()
+            if not r:
+                continue
+            if r.upper() == "ALL":
+                return self._gitea_list_all_repos()
+            cleaned.append(r)
+        return cleaned
+
     # ------------------------------------------------------------------ #
     # Delivery — единственный путь отправки, единый шаблон клавиатуры
     # ------------------------------------------------------------------ #
@@ -465,13 +488,10 @@ class TelegramWebhookBot:
             logger.info("Skipping review reminder on weekend")
             return
 
-        # Если список репозиториев пуст или задан ALL — получаем все доступные
-        repos = self.gitea_repositories
-        if not repos or repos == ["ALL"]:
-            repos = self._gitea_list_all_repos()
-            if not repos:
-                logger.warning("No repositories found via Gitea API")
-                return
+        repos = self._normalized_repositories()
+        if not repos:
+            logger.warning("No repositories found via Gitea API")
+            return
 
         for full_name in repos:
             parsed = self._extract_owner_repo(full_name)
@@ -663,12 +683,10 @@ class TelegramWebhookBot:
             logger.warning("Gitea API not configured — no PRs returned")
             return []
 
-        repos = self.gitea_repositories
-        if not repos or repos == ["ALL"]:
-            repos = self._gitea_list_all_repos()
-            if not repos:
-                logger.warning("No repositories found via Gitea API")
-                return []
+        repos = self._normalized_repositories()
+        if not repos:
+            logger.warning("No repositories found via Gitea API")
+            return []
 
         seen: set = set()
         unique_repos: List[str] = []
