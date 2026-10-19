@@ -41,6 +41,7 @@ flowchart TD
 - Ready for Vercel-style deployment
 - `GET /weekly-reminder`, `GET /review-reminder` — cron endpoints
 - Telegram command `/check` (private chats only) — shows your open PRs as a reviewer: number, clickable link, branch
+- Telegram command `/weekly_report` (private chat, Denis_Arger only) — weekly activity report (Mon–Sun, server local time) for all users from users.json except the requester: opened PRs, reviews, merged/closed PRs — number, link, repo, branch, date
 
 ## How to Run
 ```bash
@@ -94,6 +95,7 @@ flowchart TD
 - Готовность к деплою на Vercel
 - `GET /weekly-reminder`, `GET /review-reminder` — крон-эндпоинты
 - Команда Telegram `/check` (только в личных сообщениях) — ваши открытые PR как ревьюер: номер, кликабельная ссылка, ветка
+- Команда Telegram `/weekly_report` (только ЛС, только Denis_Arger) — недельный отчёт по активности (пн–вс, локальное время сервера) по пользователям из users.json, кроме самого запрашивающего: открытые PR, ревью, слитые/закрытые PR — номер, ссылка, репозиторий, ветка, дата
 
 ## Как запустить
 ```bash

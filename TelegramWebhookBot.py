@@ -20,7 +20,7 @@ import os
 import random
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import requests
@@ -761,6 +761,246 @@ class TelegramWebhookBot:
             logger.exception("/check failed for %s", rep_login)
             await update.message.reply_text("Ошибка при сборе PR. Попробуйте позже.")
 
+    # ------------------------------------------------------------------ #
+    # Telegram command: /weekly_report (только ЛС, только Denis_Arger)
+    # ------------------------------------------------------------------ #
+    def _week_bounds(self):
+        now_local = datetime.now().astimezone()
+        monday = (now_local - timedelta(days=now_local.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        sunday = (monday + timedelta(days=6)).replace(
+            hour=23, minute=59, second=59
+        )
+        return monday, sunday
+
+    @staticmethod
+    def _in_period(dt, start_utc, end_utc):
+        if dt is None:
+            return False
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return start_utc <= dt <= end_utc
+
+    def _gitea_list_all_prs(self, owner: str, repo: str) -> List[Dict]:
+        prs = []
+        page = 1
+        while True:
+            data = self._gitea_request(
+                "GET",
+                f"/repos/{owner}/{repo}/pulls",
+                params={"state": "all", "page": page, "per_page": 50},
+            )
+            if not data:
+                break
+            prs.extend(data)
+            if len(data) < 50:
+                break
+            page += 1
+        return prs
+
+    def _collect_weekly_report(self, exclude_login: Optional[str] = None):
+        if not self.gitea_url or not self.gitea_token:
+            raise RuntimeError("Gitea API not configured")
+        start_local, end_local = self._week_bounds()
+        start_utc = start_local.astimezone(timezone.utc)
+        end_utc = end_local.astimezone(timezone.utc)
+        local_tz = start_local.tzinfo
+
+        report = {}
+        for u in self.arr_of_users:
+            tg = u.get("tgName")
+            login = u.get("repName")
+            if not tg or not login:
+                continue
+            if exclude_login and login == exclude_login:
+                continue
+            report[login] = {
+                "tg": tg,
+                "login": login,
+                "opened": [],
+                "reviews": [],
+                "merged": [],
+                "closed": [],
+            }
+
+        repos = self._normalized_repositories()
+        for full_name in repos:
+            parsed = self._extract_owner_repo(full_name)
+            if not parsed:
+                continue
+            owner, repo = parsed
+            try:
+                prs = self._gitea_list_all_prs(owner, repo)
+            except Exception:
+                logger.exception("Failed to list PRs for %s/%s", owner, repo)
+                continue
+            for pr in prs:
+                author = (pr.get("user") or {}).get("login")
+                if author not in report:
+                    continue
+                number = pr.get("number")
+                url = pr.get("html_url") or f"{self.gitea_url}/{owner}/{repo}/pull/{number}"
+                repo_full = (
+                    (pr.get("base") or {}).get("repo", {}).get("full_name")
+                    or f"{owner}/{repo}"
+                )
+                entry = report[author]
+
+                created_dt = self._parse_iso(pr.get("created_at"))
+                updated_dt = self._parse_iso(pr.get("updated_at"))
+                closed_dt = self._parse_iso(pr.get("closed_at"))
+                merged_dt = self._parse_iso(pr.get("merged_at"))
+                state = (pr.get("state") or "").lower()
+
+                touched = (
+                    state == "open"
+                    or self._in_period(created_dt, start_utc, end_utc)
+                    or self._in_period(updated_dt, start_utc, end_utc)
+                    or self._in_period(closed_dt, start_utc, end_utc)
+                    or self._in_period(merged_dt, start_utc, end_utc)
+                )
+
+                item = {
+                    "number": number,
+                    "url": url,
+                    "repo": repo_full,
+                    "branch": (
+                        (pr.get("head") or {}).get("ref")
+                        or (pr.get("base") or {}).get("ref")
+                        or "?"
+                    ),
+                }
+
+                if self._in_period(created_dt, start_utc, end_utc):
+                    item["date"] = created_dt.astimezone(local_tz).strftime("%d.%m")
+                    entry["opened"].append(dict(item))
+                if merged_dt and self._in_period(merged_dt, start_utc, end_utc):
+                    item["date"] = merged_dt.astimezone(local_tz).strftime("%d.%m")
+                    entry["merged"].append(dict(item))
+                elif closed_dt and state == "closed" and self._in_period(closed_dt, start_utc, end_utc):
+                    item["date"] = closed_dt.astimezone(local_tz).strftime("%d.%m")
+                    entry["closed"].append(dict(item))
+
+                if not touched:
+                    continue
+                try:
+                    reviews = self._gitea_get_pr_reviews(owner, repo, number)
+                    comments = self._gitea_get_pr_comments(owner, repo, number)
+                except Exception:
+                    logger.exception("Failed to fetch activity for PR #%s", number)
+                    continue
+                for r in reviews or []:
+                    ru = r.get("user") or {}
+                    r_login = ru.get("login")
+                    if r_login in report:
+                        submitted_at = r.get("submitted_at")
+                        if self._in_period(self._parse_iso(submitted_at), start_utc, end_utc):
+                            entry["reviews"].append({
+                                "number": number,
+                                "url": url,
+                                "repo": repo_full,
+                                "branch": item["branch"],
+                                "type": (r.get("state") or "review"),
+                                "date": self._parse_iso(submitted_at).astimezone(local_tz).strftime("%d.%m") if submitted_at else "",
+                            })
+                for c in comments or []:
+                    cu = c.get("user") or {}
+                    c_login = cu.get("login")
+                    if c_login in report:
+                        created_at = c.get("created_at")
+                        if self._in_period(self._parse_iso(created_at), start_utc, end_utc):
+                            entry["reviews"].append({
+                                "number": number,
+                                "url": url,
+                                "repo": repo_full,
+                                "branch": item["branch"],
+                                "type": "комментарий",
+                                "date": self._parse_iso(created_at).astimezone(local_tz).strftime("%d.%m") if created_at else "",
+                            })
+        return report, start_local, end_local
+
+    @staticmethod
+    def _report_pr_line(item: Dict, suffix: str = "") -> str:
+        branch = item.get("branch") or "?"
+        line = (
+            f"• <a href=\"{item['url']}\">#{item['number']}</a> ({item['repo']}) "
+            f"— ветка: <code>{branch}</code>"
+        )
+        if suffix:
+            line += f" — {suffix}"
+        return line
+
+    def _build_weekly_report_message(self, report, start_local, end_local):
+        lines = [
+            f"Отчёт за неделю: {start_local.strftime('%d.%m')} — {end_local.strftime('%d.%m')}"
+        ]
+        any_activity = False
+        for entry in report.values():
+            tg = entry["tg"]
+            login = entry["login"]
+            parts = []
+            if entry["opened"]:
+                parts.append("📝 Открыл PR:")
+                for it in entry["opened"]:
+                    parts.append(self._report_pr_line(it, it.get("date", "")))
+            if entry["reviews"]:
+                parts.append("🔍 Ревьюил:")
+                for it in entry["reviews"]:
+                    suffix = f"{it.get('type', '')} {it.get('date', '')}".strip()
+                    parts.append(self._report_pr_line(it, suffix))
+            if entry["merged"]:
+                parts.append("✅ Merged:")
+                for it in entry["merged"]:
+                    parts.append(self._report_pr_line(it, it.get("date", "")))
+            if entry["closed"]:
+                parts.append("❌ Closed:")
+                for it in entry["closed"]:
+                    parts.append(self._report_pr_line(it, it.get("date", "")))
+            if parts:
+                any_activity = True
+                lines.append("")
+                lines.append(f"@{tg} / {login}:")
+                lines.extend(parts)
+            else:
+                lines.append("")
+                lines.append(f"@{tg} / {login}: —")
+        if not any_activity:
+            return "Нет активности за неделю."
+        return "\n".join(lines)
+
+    async def _handle_weekly_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /weekly_report — отчёт за неделю, только для Denis_Arger в ЛС."""
+        user = update.effective_user
+        tg_username = user.username if user else None
+        if not tg_username or tg_username.lstrip("@").lower() != "denis_arger":
+            await update.message.reply_text("Команда недоступна.")
+            return
+        chat = update.effective_chat
+        if chat is not None and chat.type != "private":
+            await update.message.reply_text("Команда доступна только в личном чате.")
+            return
+        denis = next(
+            (
+                u
+                for u in self.arr_of_users
+                if (u.get("tgName") or "").lstrip("@").lower() == "denis_arger"
+            ),
+            None,
+        )
+        if not denis:
+            await update.message.reply_text("Не найден в users.json.")
+            return
+        try:
+            report, start_local, end_local = self._collect_weekly_report(
+                exclude_login=denis.get("repName")
+            )
+            text = self._build_weekly_report_message(report, start_local, end_local)
+            await update.message.reply_text(text, parse_mode="HTML")
+        except Exception:
+            logger.exception("/weekly_report failed")
+            await update.message.reply_text("Ошибка при сборе данных. Попробуйте позже.")
+
     def start_telegram_listening(self) -> None:
         """Запускает polling Telegram-бота (команда /check).
 
@@ -792,6 +1032,7 @@ class TelegramWebhookBot:
         from telegram.ext import Application, CommandHandler
         app = Application.builder().token(self.TOKEN).build()
         app.add_handler(CommandHandler("check", self._handle_check))
+        app.add_handler(CommandHandler("weekly_report", self._handle_weekly_report))
         return app
 
     def _maybe_evict_throttle(self, now: float) -> None:
