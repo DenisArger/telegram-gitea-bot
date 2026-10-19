@@ -39,6 +39,8 @@ flowchart TD
 - Sends Telegram notifications for repository events
 - Supports user mapping for personalized notifications
 - Ready for Vercel-style deployment
+- `GET /weekly-reminder`, `GET /review-reminder` — cron endpoints
+- Telegram command `/check` (private chats only) — shows your open PRs as a reviewer: number, clickable link, branch
 
 ## How to Run
 ```bash
@@ -90,6 +92,8 @@ flowchart TD
 - Отправка уведомлений Telegram по событиям репозитория
 - Сопоставление пользователей для персонализации
 - Готовность к деплою на Vercel
+- `GET /weekly-reminder`, `GET /review-reminder` — крон-эндпоинты
+- Команда Telegram `/check` (только в личных сообщениях) — ваши открытые PR как ревьюер: номер, кликабельная ссылка, ветка
 
 ## Как запустить
 ```bash
@@ -100,4 +104,6 @@ cp .env.example .env
 python TelegramWebhookBot.py
 ```
 
-Для деплоя на Vercel используйте `vercel.json`, `api/` и задайте env vars в настройках проекта.
+Бот запускает Flask-сервер (вебхуки Gitea, `GET /weekly-reminder`, `GET /review-reminder`, `POST /telegram-webhook`). Telegram-команда `/check` приходит через webhook на `/telegram-webhook`.
+
+Для деплоя на Vercel используйте `vercel.json`, `api/` и задайте env vars в настройках проекта. Перед деплоем настройте Telegram webhook на `POST /telegram-webhook`.

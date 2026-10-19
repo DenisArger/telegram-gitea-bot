@@ -26,7 +26,8 @@ from typing import Dict, List, Optional
 import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ContextTypes
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,7 @@ class TelegramWebhookBot:
         self.app.route("/", methods=["GET"])(self.health_check)
         self.app.route("/weekly-reminder", methods=["GET"])(self.weekly_reminder)
         self.app.route("/review-reminder", methods=["GET"])(self.review_reminder)
+        self.app.route("/telegram-webhook", methods=["POST"])(self.telegram_webhook)
 
     def load_users(self) -> List[Dict]:
         """Load users from users.json"""
@@ -201,8 +203,31 @@ class TelegramWebhookBot:
             logger.exception("Review reminder failed")
             return jsonify({"status": "error", "message": "Internal error"}), 500
 
+    def telegram_webhook(self):
+        """Приёмник обновлений Telegram (работает на Vercel и локально).
+
+        Обрабатывает команду /check и возвращает ответ в ЛС отправителю.
+        Polling не требуется — Telegram шлёт POST на этот route.
+        """
+        try:
+            data = request.get_json(silent=True)
+            if not data:
+                return jsonify({"status": "error", "message": "Bad Request"}), 400
+            app = self._ensure_telegram_app()
+            update = Update.de_json(data, app.bot)
+
+            async def _process():
+                await app.initialize()
+                await app.process_update(update)
+
+            asyncio.run(_process())
+            return jsonify({"status": "ok"}), 200
+        except Exception:
+            logger.exception("Telegram webhook handling failed")
+            return jsonify({"status": "error", "message": "Internal error"}), 500
+
     def run(self, host: str = "127.0.0.1", port: int = 3333):
-        """Запуск сервера."""
+        """Запуск Flask-сервера (вебхуки + /telegram-webhook)."""
         self.app.run(host=host, port=port)
 
     # ------------------------------------------------------------------ #
@@ -500,6 +525,195 @@ class TelegramWebhookBot:
             f"Напоминание о непроверенном PR #{number} отправлено в Telegram."
         )
         self._gitea_post_comment(owner, repo, number, marker_body)
+
+    # ------------------------------------------------------------------ #
+    # Helpers — определение, требует ли PR ревью (используется /check)
+    # ------------------------------------------------------------------ #
+    def _pr_needs_review(self, owner: str, repo: str, pr: Dict) -> bool:
+        """True, если PR требует ревью (fail open при ошибках)."""
+        number = pr.get("number")
+        if not number:
+            return False
+
+        state = (pr.get("state") or "").lower()
+        if state != "open":
+            return False
+
+        # PR без запрошенных ревьюеров — не требует ревью (как в напоминаниях)
+        reviewers = pr.get("requested_reviewers") or []
+        if not reviewers:
+            return False
+
+        reviews = self._gitea_get_pr_reviews(owner, repo, number)
+        last_review = self._last_meaningful_review(reviews)
+        if last_review is None:
+            return True
+
+        head_sha = (pr.get("head") or {}).get("sha")
+        review_sha = last_review.get("commit_id")
+        submitted_at = last_review.get("submitted_at")
+        updated_at = pr.get("updated_at")
+
+        # Приоритет: сравнение SHA (точный), иначе даты
+        if head_sha and review_sha:
+            if str(review_sha) == str(head_sha):
+                return False
+            return True
+
+        # Фолбэк: PR не менялся после ревью
+        try:
+            if updated_at and submitted_at:
+                updated_dt = self._parse_iso(updated_at)
+                submitted_dt = self._parse_iso(submitted_at)
+                if updated_dt is not None and submitted_dt is not None:
+                    return updated_dt > submitted_dt
+        except Exception:
+            logger.warning("Failed to compare review/PR dates for #%s", number)
+
+        # Не можем однозначно определить — включаем (fail open)
+        return True
+
+    @staticmethod
+    def _last_meaningful_review(reviews: List[Dict]) -> Optional[Dict]:
+        """Последнее ревью с состоянием approved/changes_requested/rejected/
+        commented/request_changes. По submitted_at (новейшее)."""
+        states = {
+            "approved", "changes_requested", "rejected", "commented",
+            "request_changes",
+        }
+        meaningful = [
+            r for r in reviews
+            if (r.get("state") or "").lower() in states
+        ]
+        if not meaningful:
+            return None
+
+        def sort_key(r: Dict):
+            ts = r.get("submitted_at")
+            try:
+                return (0, TelegramWebhookBot._parse_iso(ts) or datetime.min.replace(tzinfo=timezone.utc))
+            except Exception:
+                return (1, datetime.min.replace(tzinfo=timezone.utc))
+
+        return max(meaningful, key=sort_key)
+
+    @staticmethod
+    def _parse_iso(value) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------ #
+    # Telegram command: /check (только в ЛС, личные PR ревьюера)
+    # ------------------------------------------------------------------ #
+    def _resolve_rep_login_from_tg(self, tg_username: Optional[str]) -> Optional[str]:
+        """Маппинг telegram-username -> Gitea login через users.json."""
+        if not tg_username:
+            return None
+        norm = tg_username.lstrip("@").lower()
+        for u in self.arr_of_users:
+            tg = u.get("tgName")
+            if tg and tg.lstrip("@").lower() == norm:
+                return u.get("repName")
+        return None
+
+    def _collect_prs_for_reviewer(self, reviewer_login: str) -> List[Dict]:
+        """Открытые PR, где reviewer_login в requested_reviewers и PR требует ревью."""
+        if not self.gitea_url or not self.gitea_token:
+            logger.warning("Gitea API not configured — no PRs returned")
+            return []
+
+        repos = self.gitea_repositories
+        if not repos or repos == ["ALL"]:
+            repos = self._gitea_list_all_repos()
+            if not repos:
+                logger.warning("No repositories found via Gitea API")
+                return []
+
+        seen: set = set()
+        unique_repos: List[str] = []
+        for full_name in repos:
+            if full_name and full_name not in seen:
+                seen.add(full_name)
+                unique_repos.append(full_name)
+
+        result: List[Dict] = []
+        for full_name in unique_repos:
+            parsed = self._extract_owner_repo(full_name)
+            if not parsed:
+                logger.warning("Invalid repository format: %s", full_name)
+                continue
+            owner, repo = parsed
+            try:
+                for pr in self._gitea_list_open_prs(owner, repo):
+                    reviewers = [
+                        (r.get("login") if isinstance(r, dict) else r)
+                        for r in (pr.get("requested_reviewers") or [])
+                    ]
+                    if reviewer_login not in reviewers:
+                        continue
+                    if self._pr_needs_review(owner, repo, pr):
+                        result.append(pr)
+            except Exception:
+                logger.exception("Failed to collect PRs for %s/%s", owner, repo)
+        return result
+
+    def _build_my_prs_message(self, prs: List[Dict]) -> str:
+        if not prs:
+            return "У вас нет PR, требующих ревью."
+
+        lines = [f"У вас {len(prs)} PR, требующих ревью:"]
+        for pr in prs:
+            repo = pr.get("base", {}).get("repo", {}).get("full_name") or "?"
+            number = pr.get("number", "?")
+            url = pr.get("html_url") or f"{self.gitea_url}/{repo}/pull/{number}"
+            branch = (pr.get("head") or {}).get("ref") or "?"
+            lines.append(
+                f"• <a href=\"{url}\">#{number}</a> ({repo}) ветка: <code>{branch}</code>"
+            )
+        return "\n".join(lines)
+
+    async def _handle_check(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /check — личные PR, где пользователь ревьюер."""
+        user = update.effective_user
+        tg_username = user.username if user else None
+        rep_login = self._resolve_rep_login_from_tg(tg_username)
+
+        if not rep_login:
+            await update.message.reply_text(
+                "Не найден Gitea-логин для вашего telegram-аккаунта. "
+                "Обратитесь к администратору."
+            )
+            return
+
+        logger.info("/check from tg=%s -> gitea=%s", tg_username, rep_login)
+        try:
+            prs = self._collect_prs_for_reviewer(rep_login)
+            text = self._build_my_prs_message(prs)
+            await update.message.reply_text(text, parse_mode="HTML")
+        except Exception:
+            logger.exception("/check failed for %s", rep_login)
+            await update.message.reply_text("Ошибка при сборе PR. Попробуйте позже.")
+
+    def _ensure_telegram_app(self):
+        """Создаёт Telegram Application с обработчиком /check.
+
+        Вызывается при каждом webhook-запросе (на Vercel каждый вызов —
+        отдельный serverless-экземпляр, кэширование бессмысленно).
+        """
+        # Python 3.7: в потоке Flask event loop может отсутствовать
+        try:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+        except RuntimeError:
+            pass
+
+        from telegram.ext import Application, CommandHandler
+        app = Application.builder().token(self.TOKEN).build()
+        app.add_handler(CommandHandler("check", self._handle_check))
+        return app
 
     def _maybe_evict_throttle(self, now: float) -> None:
         self._throttle_evict_counter += 1
