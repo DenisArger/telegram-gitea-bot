@@ -40,6 +40,7 @@ flowchart TD
 - Supports user mapping for personalized notifications
 - Ready for Vercel-style deployment
 - `GET /weekly-reminder`, `GET /review-reminder` — cron endpoints
+- `GET /prs-to-review` — JSON-список PR, требующих ревью (query param `reviewer`, по умолчанию Denis_Arger)
 - Telegram command `/check` (private chats only) — shows your open PRs as a reviewer: number, clickable link, branch
 - Telegram command `/weekly_report` (private chat, Denis_Arger only) — weekly activity report (Mon–Sun, server local time) for all users from users.json except the requester: opened PRs, reviews, merged/closed PRs — number, link, repo, branch, date
 
@@ -94,6 +95,7 @@ flowchart TD
 - Сопоставление пользователей для персонализации
 - Готовность к деплою на Vercel
 - `GET /weekly-reminder`, `GET /review-reminder` — крон-эндпоинты
+- `GET /prs-to-review` — JSON-список PR, требующих ревью (query param `reviewer`, по умолчанию Denis_Arger)
 - Команда Telegram `/check` (только в личных сообщениях) — ваши открытые PR как ревьюер: номер, кликабельная ссылка, ветка
 - Команда Telegram `/weekly_report` (только ЛС, только Denis_Arger) — недельный отчёт по активности (пн–вс, локальное время сервера) по пользователям из users.json, кроме самого запрашивающего: открытые PR, ревью, слитые/закрытые PR — номер, ссылка, репозиторий, ветка, дата
 
@@ -106,6 +108,6 @@ cp .env.example .env
 python TelegramWebhookBot.py
 ```
 
-Бот запускает Flask-сервер (вебхуки Gitea, `GET /weekly-reminder`, `GET /review-reminder`, `POST /telegram-webhook`). Telegram-команда `/check` приходит через webhook на `/telegram-webhook`.
+Бот запускает Flask-сервер (вебхуки Gitea, `GET /weekly-reminder`, `GET /review-reminder`, `GET /prs-to-review`, `POST /telegram-webhook`). Telegram-команда `/check` приходит через webhook на `/telegram-webhook`.
 
 Для деплоя на Vercel используйте `vercel.json`, `api/` и задайте env vars в настройках проекта. Перед деплоем настройте Telegram webhook на `POST /telegram-webhook`.

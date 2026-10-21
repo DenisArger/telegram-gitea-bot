@@ -105,6 +105,7 @@ class TelegramWebhookBot:
         self.app.route("/telegram-webhook", methods=["POST"])(self.telegram_webhook)
         self.app.route("/set-webhook", methods=["GET"])(self.set_telegram_webhook)
         self.app.route("/get-webhook-info", methods=["GET"])(self.get_telegram_webhook_info)
+        self.app.route("/prs-to-review", methods=["GET"])(self.prs_to_review)
 
     def load_users(self) -> List[Dict]:
         """Load users from users.json"""
@@ -263,6 +264,32 @@ class TelegramWebhookBot:
             logger.exception("getWebhookInfo failed")
             return jsonify({"status": "error", "message": "Internal error"}), 500
 
+    def prs_to_review(self):
+        """GET /prs-to-review — JSON-ответ со списком PR, требующих ревью.
+
+        Query param: reviewer (Gitea login, по умолчанию Denis_Arger).
+        """
+        try:
+            reviewer_login = request.args.get("reviewer") or "Denis_Arger"
+            prs = self._collect_prs_for_reviewer(reviewer_login)
+            items = []
+            for pr in prs:
+                repo = pr.get("base", {}).get("repo", {}).get("full_name") or "?"
+                number = pr.get("number", "?")
+                url = pr.get("html_url") or f"{self.gitea_url}/{repo}/pull/{number}"
+                branch = (pr.get("head") or {}).get("ref") or "?"
+                items.append({
+                    "number": number,
+                    "title": pr.get("title") or "",
+                    "url": url,
+                    "repo": repo,
+                    "branch": branch,
+                })
+            return jsonify({"status": "ok", "reviewer": reviewer_login, "count": len(items), "prs": items}), 200
+        except Exception:
+            logger.exception("/prs-to-review failed")
+            return jsonify({"status": "error", "message": "Internal error"}), 500
+
     def run(self, host: str = "127.0.0.1", port: int = 3333):
         """Запуск Flask-сервера (вебхуки + /telegram-webhook).
 
@@ -322,6 +349,30 @@ class TelegramWebhookBot:
                 "GET",
                 f"/repos/{owner}/{repo}/pulls",
                 params={"state": "open", "page": page, "per_page": 50},
+            )
+            if not data:
+                break
+            prs.extend(data)
+            if len(data) < 50:
+                break
+            page += 1
+        return prs
+
+    def _gitea_list_prs_reviewed_by(self, owner: str, repo: str, username: str) -> List[Dict]:
+        """PR, где username оставил отзыв/комментарий (type=reviewed_by)."""
+        prs = []
+        page = 1
+        while True:
+            data = self._gitea_request(
+                "GET",
+                f"/repos/{owner}/{repo}/pulls",
+                params={
+                    "type": "reviewed_by",
+                    "sort": "recentupdate",
+                    "state": "open",
+                    "page": page,
+                    "per_page": 50,
+                },
             )
             if not data:
                 break
@@ -594,6 +645,27 @@ class TelegramWebhookBot:
     # ------------------------------------------------------------------ #
     # Helpers — определение, требует ли PR ревью (используется /check)
     # ------------------------------------------------------------------ #
+    def _is_wip_pr(self, pr: Dict) -> bool:
+        """True, если PR — WIP/черновик (по заголовку или ветке)."""
+        title = pr.get("title") or ""
+        head_ref = (pr.get("head") or {}).get("ref") or ""
+
+        title_upper = title.upper()
+        if (
+            title_upper.startswith("[WIP]")
+            or title_upper.startswith("WIP:")
+            or title_upper.startswith("DRAFT:")
+            or title_upper.startswith("WIP ")
+            or title_upper == "WIP"
+        ):
+            return True
+
+        head_lower = head_ref.lower()
+        if head_lower.startswith("wip/") or head_lower.startswith("draft/"):
+            return True
+
+        return False
+
     def _pr_needs_review(self, owner: str, repo: str, pr: Dict) -> bool:
         """True, если PR требует ревью (fail open при ошибках)."""
         number = pr.get("number")
@@ -686,7 +758,14 @@ class TelegramWebhookBot:
         return None
 
     def _collect_prs_for_reviewer(self, reviewer_login: str) -> List[Dict]:
-        """Открытые PR, где reviewer_login в requested_reviewers и PR требует ревью."""
+        """Открытые PR, требующие ревью от reviewer_login.
+
+        Источники:
+        1. PR, где reviewer_left отзыв/комментарий (reviewed_by).
+        2. PR, где reviewer_login в requested_reviewers (запрошен, но не ответил).
+
+        Дeduplication по (owner, repo, number). Фильтры: WIP, свежесть ревью.
+        """
         if not self.gitea_url or not self.gitea_token:
             logger.warning("Gitea API not configured — no PRs returned")
             return []
@@ -696,13 +775,14 @@ class TelegramWebhookBot:
             logger.warning("No repositories found via Gitea API")
             return []
 
-        seen: set = set()
+        seen_repos: set = set()
         unique_repos: List[str] = []
         for full_name in repos:
-            if full_name and full_name not in seen:
-                seen.add(full_name)
+            if full_name and full_name not in seen_repos:
+                seen_repos.add(full_name)
                 unique_repos.append(full_name)
 
+        seen_prs: set = set()
         result: List[Dict] = []
         for full_name in unique_repos:
             parsed = self._extract_owner_repo(full_name)
@@ -710,18 +790,41 @@ class TelegramWebhookBot:
                 logger.warning("Invalid repository format: %s", full_name)
                 continue
             owner, repo = parsed
+
+            # Source 1: PRs where the reviewer left a review/comment
+            reviewed_prs: List[Dict] = []
+            try:
+                reviewed_prs = self._gitea_list_prs_reviewed_by(owner, repo, reviewer_login)
+            except Exception:
+                logger.exception("Failed to list reviewed_by PRs for %s/%s", owner, repo)
+                reviewed_prs = []
+
+            # Source 2: PRs where the reviewer is requested but hasn't responded
+            requested_prs: List[Dict] = []
             try:
                 for pr in self._gitea_list_open_prs(owner, repo):
                     reviewers = [
                         (r.get("login") if isinstance(r, dict) else r)
                         for r in (pr.get("requested_reviewers") or [])
                     ]
-                    if reviewer_login not in reviewers:
-                        continue
-                    if self._pr_needs_review(owner, repo, pr):
-                        result.append(pr)
+                    if reviewer_login in reviewers:
+                        requested_prs.append(pr)
             except Exception:
-                logger.exception("Failed to collect PRs for %s/%s", owner, repo)
+                logger.exception("Failed to list open PRs for %s/%s", owner, repo)
+                requested_prs = []
+
+            for pr in reviewed_prs + requested_prs:
+                key = (owner, repo, pr.get("number"))
+                if key in seen_prs:
+                    continue
+                seen_prs.add(key)
+
+                if self._is_wip_pr(pr):
+                    continue
+                if not self._pr_needs_review(owner, repo, pr):
+                    continue
+                result.append(pr)
+
         return result
 
     def _build_my_prs_message(self, prs: List[Dict]) -> str:
