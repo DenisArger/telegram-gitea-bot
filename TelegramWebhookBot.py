@@ -858,6 +858,7 @@ class TelegramWebhookBot:
         logger.info("/check from tg=%s -> gitea=%s", tg_username, rep_login)
         try:
             prs = self._collect_prs_for_reviewer(rep_login)
+            logger.info("/check PRs for %s: count=%d", rep_login, len(prs))
             text = self._build_my_prs_message(prs)
             await update.message.reply_text(text, parse_mode="HTML")
         except Exception:
