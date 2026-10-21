@@ -772,7 +772,7 @@ class TelegramWebhookBot:
 
         repos = self._normalized_repositories()
         if not repos:
-            logger.warning("No repositories found via Gitea API")
+            logger.warning("[DEBUG /check] No repositories found via Gitea API")
             return []
 
         seen_repos: set = set()
@@ -781,6 +781,8 @@ class TelegramWebhookBot:
             if full_name and full_name not in seen_repos:
                 seen_repos.add(full_name)
                 unique_repos.append(full_name)
+
+        logger.info("[DEBUG /check] repos=%d reviewer=%s", len(unique_repos), reviewer_login)
 
         seen_prs: set = set()
         result: List[Dict] = []
@@ -796,7 +798,7 @@ class TelegramWebhookBot:
             try:
                 reviewed_prs = self._gitea_list_prs_reviewed_by(owner, repo, reviewer_login)
             except Exception:
-                logger.exception("Failed to list reviewed_by PRs for %s/%s", owner, repo)
+                logger.exception("[DEBUG /check] Failed to list reviewed_by PRs for %s/%s", owner, repo)
                 reviewed_prs = []
 
             # Source 2: PRs where the reviewer is requested but hasn't responded
@@ -810,9 +812,11 @@ class TelegramWebhookBot:
                     if reviewer_login in reviewers:
                         requested_prs.append(pr)
             except Exception:
-                logger.exception("Failed to list open PRs for %s/%s", owner, repo)
+                logger.exception("[DEBUG /check] Failed to list open PRs for %s/%s", owner, repo)
                 requested_prs = []
 
+            wip_skipped = 0
+            fresh_skipped = 0
             for pr in reviewed_prs + requested_prs:
                 key = (owner, repo, pr.get("number"))
                 if key in seen_prs:
@@ -820,11 +824,19 @@ class TelegramWebhookBot:
                 seen_prs.add(key)
 
                 if self._is_wip_pr(pr):
+                    wip_skipped += 1
                     continue
                 if not self._pr_needs_review(owner, repo, pr):
+                    fresh_skipped += 1
                     continue
                 result.append(pr)
 
+            logger.info(
+                "[DEBUG /check] %s/%s reviewed=%d requested=%d wip_skip=%d fresh_skip=%d",
+                owner, repo, len(reviewed_prs), len(requested_prs), wip_skipped, fresh_skipped,
+            )
+
+        logger.info("[DEBUG /check] final count=%d reviewer=%s", len(result), reviewer_login)
         return result
 
     def _build_my_prs_message(self, prs: List[Dict]) -> str:
