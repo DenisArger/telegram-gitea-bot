@@ -1344,7 +1344,11 @@ class TelegramWebhookBot:
         if variant == 1:
             colleagues = [u for u in self.arr_of_users if u.get("tgName") and u.get("repName") != rep]
             random.shuffle(colleagues)
-            picked = [u["tgName"].lstrip("@") for u in colleagues[: random.randint(2, 3)]] if colleagues else []
+            # DenisArger всегда первый, остальные — в случайном порядке
+            denis = next((u for u in colleagues if u.get("repName") == "DenisArger"), None)
+            others = [u for u in colleagues if u.get("repName") != "DenisArger"]
+            ordered = ([denis] if denis else []) + others
+            picked = [u["tgName"].lstrip("@") for u in ordered] if ordered else []
             if picked:
                 lines.append(f"✅ Одобрен: {', '.join(picked)}")
         return "\n".join(lines)
