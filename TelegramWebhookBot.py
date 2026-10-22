@@ -1260,13 +1260,21 @@ class TelegramWebhookBot:
         parts = s.split("-")
         try:
             if len(parts) == 2:
-                m, d = int(parts[0]), int(parts[1])
+                a, b = int(parts[0]), int(parts[1])
                 y = 2000
             elif len(parts) == 3:
-                y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+                y, a, b = int(parts[0]), int(parts[1]), int(parts[2])
             else:
                 raise ValueError
-            return (m, d)
+            # Поддерживаем оба формата: DD-MM (день-месяц) и MM-DD (месяц-день).
+            # Определяем по диапазону: месяц не бывает > 12, день — не > 31.
+            def _valid(month: int, day: int) -> bool:
+                return 1 <= month <= 12 and 1 <= day <= 31
+            if _valid(a, b):
+                return (a, b)  # MM-DD
+            if _valid(b, a):
+                return (b, a)  # DD-MM
+            raise ValueError(f"cannot interpret {a}-{b} as date")
         except (ValueError, TypeError):
             logger.warning("Invalid birthday value: %r", value)
             return None
