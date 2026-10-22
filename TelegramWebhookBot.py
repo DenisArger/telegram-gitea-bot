@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import hmac
 import json
 import logging
@@ -101,6 +102,7 @@ class TelegramWebhookBot:
         self.app.route("/", methods=["POST"])(self.webhook)
         self.app.route("/", methods=["GET"])(self.health_check)
         self.app.route("/weekly-reminder", methods=["GET"])(self.weekly_reminder)
+        self.app.route("/birthday-reminder", methods=["GET"])(self.birthday_reminder)
         self.app.route("/review-reminder", methods=["GET"])(self.review_reminder)
         self.app.route("/telegram-webhook", methods=["POST"])(self.telegram_webhook)
         self.app.route("/set-webhook", methods=["GET"])(self.set_telegram_webhook)
@@ -1149,6 +1151,7 @@ class TelegramWebhookBot:
         app = Application.builder().token(self.TOKEN).build()
         app.add_handler(CommandHandler("check", self._handle_check))
         app.add_handler(CommandHandler("weekly_report", self._handle_weekly_report))
+        app.add_handler(CommandHandler("birthday", self._handle_birthday))
         return app
 
     def _maybe_evict_throttle(self, now: float) -> None:
@@ -1247,8 +1250,175 @@ class TelegramWebhookBot:
         return f"{random.choice(templates)}\n{self._mentions_str(mentions)}"
 
     # ------------------------------------------------------------------ #
+    # Birthday greetings
+    # ------------------------------------------------------------------ #
+    def _parse_birthday(self, value):
+        from datetime import date
+        s = (value or "").strip()
+        if not s:
+            return None
+        parts = s.split("-")
+        try:
+            if len(parts) == 2:
+                m, d = int(parts[0]), int(parts[1])
+                y = 2000
+            elif len(parts) == 3:
+                y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+            else:
+                raise ValueError
+            return (m, d)
+        except (ValueError, TypeError):
+            logger.warning("Invalid birthday value: %r", value)
+            return None
+
+    def _birthday_date_today(self):
+        from datetime import datetime
+        return datetime.now().astimezone().date()
+
+    def _birthday_users_on(self, day):
+        from datetime import date
+        result = []
+        for u in self.arr_of_users:
+            if not u.get("tgName"):
+                continue
+            bd = self._parse_birthday(u.get("birthday"))
+            if bd is None:
+                if (u.get("birthday") or "").strip():
+                    pass
+                continue
+            m, d = bd
+            # 29 Feb handling
+            try:
+                cand = date(day.year, m, d)
+            except ValueError:
+                if m == 2 and d == 29:
+                    # non-leap: congratulate Feb 28
+                    logger.debug("Feb 29 birthday -> Feb 28 in non-leap year")
+                    cand = date(day.year, 2, 28)
+                else:
+                    continue
+            if cand.month == day.month and cand.day == day.day:
+                result.append(u)
+        return result
+
+    def _birthday_pr_number(self, login):
+        h = hashlib.md5((login or "").encode()).hexdigest()
+        return 100 + (int(h, 16) % 900)
+
+    _BIRTHDAY_WISHES = [
+        "Пусть все твои PR проходят ревью с первого раза 🎯",
+        "Пусть в этом году будет минимум merge-конфликтов 🍰",
+        "Пусть сбррка будет без ошибок, а дедлайны — добрыми 🟢",
+        "Пусть задачи будут маленькими, а планы — большими 🐢",
+        "Пусть ревью будут только APPOVE 💚",
+    ]
+
+    def _build_birthday_message(self, user, variant):
+        import random
+        tg = user.get("tgName")
+        rep = user.get("repName")
+        n = self._birthday_pr_number(rep)
+        wish = (user.get("wish") or "").strip()
+        if not wish:
+            wish = random.choice(self._BIRTHDAY_WISHES)
+        wish_esc = html.escape(wish)
+        lines = []
+        lines.append(f"🔔 @{tg}")
+        if variant == 1:
+            lines.append(f"🎂 Проверьте PR #{n} (Life) — ветка: birthday/{rep}")
+        else:
+            lines.append(f"✅ PR #{n} (Life) смержен — ветка: birthday/{rep}")
+        lines.append("<pre>--- a/поздравление")
+        lines.append("+++ b/поздравление")
+        lines.append("@@ -0,0 +1,2 @@")
+        lines.append("+ С днём рождения! 🎂")
+        lines.append(f"+ {wish_esc}</pre>")
+        if variant == 1:
+            colleagues = [u for u in self.arr_of_users if u.get("tgName") and u.get("repName") != rep]
+            random.shuffle(colleagues)
+            picked = [u["tgName"].lstrip("@") for u in colleagues[: random.randint(2, 3)]] if colleagues else []
+            if picked:
+                lines.append(f"✅ Одобрен: {', '.join(picked)}")
+        return "\n".join(lines)
+
+    async def send_birthday_greetings(self):
+        import random
+        day = self._birthday_date_today()
+        users = self._birthday_users_on(day)
+        sent = 0
+        for u in users:
+            variant = random.choice([1, 2])
+            text = self._build_birthday_message(u, variant)
+            try:
+                ok = await self.send_plain_message(text)
+                if ok:
+                    sent += 1
+            except Exception:
+                logger.exception("Birthday send failed for %s", u.get("tgName"))
+        return sent
+
+    def birthday_reminder(self):
+        try:
+            preview = request.args.get("preview") == "1"
+            day = self._birthday_date_today()
+            users = self._birthday_users_on(day)
+            import random
+            messages = []
+            for u in users:
+                variant = random.choice([1, 2])
+                messages.append(self._build_birthday_message(u, variant))
+            if preview:
+                return jsonify({"status": "success", "count": len(messages), "messages": messages}), 200
+            sent = 0
+            for text in messages:
+                try:
+                    asyncio.run(self.send_plain_message(text))
+                    sent += 1
+                except Exception:
+                    logger.exception("Birthday send failed")
+            return jsonify({"status": "success", "count": sent}), 200
+        except Exception:
+            logger.exception("Birthday reminder failed")
+            return jsonify({"status": "error", "message": "Internal error"}), 500
+
+    async def _handle_birthday(self, update, context):
+        user = update.effective_user
+        tg_username = user.username if user else None
+        if not tg_username or tg_username.lstrip("@").lower() != "denis_arger":
+            await update.message.reply_text("Команда недоступна.")
+            return
+        chat = update.effective_chat
+        if chat is not None and chat.type != "private":
+            await update.message.reply_text("Команда доступна только в личном чате.")
+            return
+        args = (context.args or [])
+        preview = "preview" in [a.lower() for a in args]
+        import random
+        day = self._birthday_date_today()
+        users = self._birthday_users_on(day)
+        messages = [self._build_birthday_message(u, random.choice([1, 2])) for u in users]
+        if preview:
+            for m in messages:
+                await update.message.reply_text(m, parse_mode="HTML")
+            if not messages:
+                await update.message.reply_text("Сегодня именинников нет 🎂")
+            return
+        sent = 0
+        for text in messages:
+            try:
+                if await self.send_plain_message(text):
+                    sent += 1
+            except Exception:
+                logger.exception("/birthday send failed")
+        if sent == 0 and not messages:
+            await update.message.reply_text("Сегодня именинников нет 🎂")
+        else:
+            await update.message.reply_text(f"Отправлено: {sent}")
+
+    # ------------------------------------------------------------------ #
     # Event routing
     # ------------------------------------------------------------------ #
+
     async def process_event(self, action, data, main_user, repo_name, branch, rep_link):
         logger.info("Incoming event: action=%s repo=%s pr=%s sender=%s",
                     action, repo_name, self._pr_number(data), main_user.get("repName"))

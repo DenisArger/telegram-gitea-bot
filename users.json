@@ -1,11 +1,47 @@
 [
-  {"repName": "LeonidParfenov", "tgName": "ljkiu_o"},
-  {"repName": "RomanProtchenko", "tgName": "nesterpetrov"},
-  {"repName": "DenisArger", "tgName": "Denis_Arger"},
-  {"repName": "VeronikaRitareva", "tgName": "vritareva"},
-  {"repName": "NikitaHalukh", "tgName": "gn370p0"},
-  {"repName": "AleksandrOvsyanikov", "tgName": "iressq"},
-  {"repName": "DaniilKrauchanka", "tgName": "Krava_DpS"},
-  {"repName": "AntonKharlan", "tgName": "ankharlan"},
-  {"repName": "ArtemMiroshnichenko", "tgName": "Blarky"}
+  {
+    "repName": "LeonidParfenov",
+    "tgName": "ljkiu_o",
+    "birthday": ""
+  },
+  {
+    "repName": "RomanProtchenko",
+    "tgName": "nesterpetrov",
+    "birthday": ""
+  },
+  {
+    "repName": "DenisArger",
+    "tgName": "Denis_Arger",
+    "birthday": ""
+  },
+  {
+    "repName": "VeronikaRitareva",
+    "tgName": "vritareva",
+    "birthday": ""
+  },
+  {
+    "repName": "NikitaHalukh",
+    "tgName": "gn370p0",
+    "birthday": "22-10"
+  },
+  {
+    "repName": "AleksandrOvsyanikov",
+    "tgName": "iressq",
+    "birthday": ""
+  },
+  {
+    "repName": "DaniilKrauchanka",
+    "tgName": "Krava_DpS",
+    "birthday": ""
+  },
+  {
+    "repName": "AntonKharlan",
+    "tgName": "ankharlan",
+    "birthday": ""
+  },
+  {
+    "repName": "ArtemMiroshnichenko",
+    "tgName": "Blarky",
+    "birthday": ""
+  }
 ]
