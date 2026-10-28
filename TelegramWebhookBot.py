@@ -400,6 +400,66 @@ class TelegramWebhookBot:
         )
         return data or []
 
+    def _gitea_get_pr_review_comments(self, owner: str, repo: str, number: int) -> List[Dict]:
+        data = self._gitea_request(
+            "GET", f"/repos/{owner}/{repo}/pulls/{number}/comments"
+        )
+        return data if isinstance(data, list) else []
+
+    def _pr_thread_mentions(self, data: Dict, exclude: Optional[str] = None) -> List[str]:
+        """Collect thread participants for a PR comment: PR author + everyone who already commented/reviewed."""
+        exclude = exclude or ""
+        pr = data.get("pull_request") or {}
+        issue = data.get("issue") or {}
+        repo_info = data.get("repository") or {}
+        owner = (
+            repo_info.get("owner", {}).get("login")
+            or repo_info.get("owner_name")
+            or (repo_info.get("owner") or {}).get("username")
+        )
+        repo = repo_info.get("name") or data.get("repository", {}).get("repo")
+        number = pr.get("number") or issue.get("number")
+        if not all([owner, repo, number]):
+            return []
+
+        participants = set()
+        pr_author = pr.get("user", {}).get("login") or issue.get("user", {}).get("login")
+        if pr_author:
+            participants.add(pr_author)
+
+        try:
+            for c in self._gitea_get_pr_comments(owner, repo, int(number)):
+                u = (c.get("user") or {}).get("login")
+                if u:
+                    participants.add(u)
+        except Exception:
+            logger.debug("Failed to fetch issue comments for PR thread mentions", exc_info=True)
+
+        try:
+            for r in self._gitea_get_pr_reviews(owner, repo, int(number)):
+                u = (r.get("user") or {}).get("login")
+                if u:
+                    participants.add(u)
+        except Exception:
+            logger.debug("Failed to fetch PR reviews for PR thread mentions", exc_info=True)
+
+        try:
+            for rc in self._gitea_get_pr_review_comments(owner, repo, int(number)):
+                u = (rc.get("user") or {}).get("login")
+                if u:
+                    participants.add(u)
+        except Exception:
+            logger.debug("Failed to fetch PR review comments for PR thread mentions", exc_info=True)
+
+        mentions: List[str] = []
+        for login in participants:
+            if not login or login == exclude:
+                continue
+            tg = self._tg_by_login.get(login)
+            if tg and tg not in mentions:
+                mentions.append(tg)
+        return mentions
+
     def _gitea_post_comment(self, owner: str, repo: str, number: int, body: str) -> bool:
         # Gitea: комментарии к PR пишутся через issues API
         data = self._gitea_request(
@@ -1577,13 +1637,7 @@ class TelegramWebhookBot:
             comment_body = data.get("comment", {}).get("body", "")[:100]
             logger.info("comment_created: author=%s body_preview=%r",
                         comment_author, comment_body)
-            pr_author_login = data.get("pull_request", {}).get("user", {}).get("login")
-            pr_author_tg = self._tg_name(pr_author_login)
-            author_mention = f"@{pr_author_tg}" if pr_author_tg else (pr_author_login or "Автор PR")
-
-            mentions = self._reviewer_mentions(data, exclude=comment_author)
-            if pr_author_tg and pr_author_tg not in mentions and pr_author_login != comment_author:
-                mentions.append(f"@{pr_author_tg}")
+            mentions = self._pr_thread_mentions(data, exclude=comment_author)
 
             text = self._build("💬 новый комментарий", data, repo, url, mentions)
         elif action == "synchronized":
@@ -1617,12 +1671,7 @@ class TelegramWebhookBot:
 
         # Build mentions: PR author + reviewers (excluding comment author)
         def build_comment_mentions() -> List[str]:
-            mentions = []
-            if pr_author_tg and pr_author_login != comment_author:
-                mentions.append(f"@{pr_author_tg}")
-            reviewers = self._reviewer_mentions(data, exclude=comment_author)
-            mentions.extend(reviewers)
-            return mentions
+            return self._pr_thread_mentions(data, exclude=comment_author)
 
         if review_type == "pull_request_review_approved":
             text = self._build("✅ одобрен", data, repo, url, [author_mention])
