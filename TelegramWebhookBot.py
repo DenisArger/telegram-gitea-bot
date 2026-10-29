@@ -1147,6 +1147,221 @@ class TelegramWebhookBot:
             return "Нет активности за неделю."
         return "\n".join(lines)
 
+    def _build_weekly_report_table(self, report, start_local, end_local):
+        """Моноширинная таблица итогов за неделю (для просмотра и печати)."""
+        header = ["Сотрудник", "Открыл PR", "Ревьюил", "Merged", "Закрыл", "Всего"]
+        rows = []
+        for entry in report.values():
+            total = (
+                len(entry["opened"])
+                + len(entry["reviews"])
+                + len(entry["merged"])
+                + len(entry["closed"])
+            )
+            rows.append(
+                [
+                    f"{entry['tg']} / {entry['login']}",
+                    str(len(entry["opened"])),
+                    str(len(entry["reviews"])),
+                    str(len(entry["merged"])),
+                    str(len(entry["closed"])),
+                    str(total),
+                ]
+            )
+
+        widths = [len(h) for h in header]
+        for row in rows:
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], len(cell))
+
+        sep = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+
+        lines = [
+            f"Отчёт за неделю: {start_local.strftime('%d.%m')} — {end_local.strftime('%d.%m')}",
+            "",
+            sep,
+        ]
+        lines.append(
+            "|" + "|".join(f" {header[i].ljust(widths[i])} " for i in range(len(header))) + "|"
+        )
+        lines.append(sep)
+        for row in rows:
+            lines.append(
+                "|" + "|".join(f" {row[i].ljust(widths[i])} " for i in range(len(row))) + "|"
+            )
+        lines.append(sep)
+
+        if not rows:
+            lines.append("")
+            lines.append("Нет данных за неделю.")
+
+        return "\n".join(lines)
+
+    def _build_weekly_report_csv(self, report):
+        """CSV-отчёт для экспорта в Excel / Google Sheets и печати."""
+        import csv
+        import io
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(
+            ["Сотрудник (TG / Gitea)", "Открыл PR", "Ревьюил", "Merged", "Закрыл", "Всего"]
+        )
+        for entry in report.values():
+            total = (
+                len(entry["opened"])
+                + len(entry["reviews"])
+                + len(entry["merged"])
+                + len(entry["closed"])
+            )
+            writer.writerow(
+                [
+                    f"{entry['tg']} / {entry['login']}",
+                    len(entry["opened"]),
+                    len(entry["reviews"]),
+                    len(entry["merged"]),
+                    len(entry["closed"]),
+                    total,
+                ]
+            )
+        return output.getvalue()
+
+    def _build_weekly_report_pdf(self, report, start_local, end_local):
+        """PDF-отчёт с таблицей итогов за неделю (reportlab)."""
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib import colors
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import (
+            SimpleDocTemplate,
+            Table,
+            TableStyle,
+            Paragraph,
+            Spacer,
+        )
+        from reportlab.lib.units import mm
+        from io import BytesIO
+
+        styles = getSampleStyleSheet()
+        title_style = styles["Heading1"]
+        subtitle_style = styles["Normal"]
+
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=A4,
+            leftMargin=15 * mm,
+            rightMargin=15 * mm,
+            topMargin=15 * mm,
+            bottomMargin=15 * mm,
+            title=f"Отчёт за неделю: {start_local.strftime('%d.%m')} — {end_local.strftime('%d.%m')}",
+        )
+
+        elements = []
+        elements.append(
+            Paragraph(
+                f"Отчёт за неделю: {start_local.strftime('%d.%m')} — {end_local.strftime('%d.%m')}",
+                title_style,
+            )
+        )
+        elements.append(Spacer(1, 6 * mm))
+
+        data = [["Сотрудник", "Открыл PR", "Ревьюил", "Merged", "Закрыл", "Всего"]]
+        for entry in report.values():
+            total = (
+                len(entry["opened"])
+                + len(entry["reviews"])
+                + len(entry["merged"])
+                + len(entry["closed"])
+            )
+            data.append(
+                [
+                    f"{entry['tg']} / {entry['login']}",
+                    str(len(entry["opened"])),
+                    str(len(entry["reviews"])),
+                    str(len(entry["merged"])),
+                    str(len(entry["closed"])),
+                    str(total),
+                ]
+            )
+
+        table = Table(data, repeatRows=1)
+        style = [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+            ("ALIGN", (1, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#DCE6F1")]),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]
+        table.setStyle(TableStyle(style))
+        elements.append(table)
+
+        doc.build(elements)
+        return buffer.getvalue()
+
+    async def _handle_weekly_report_table(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /weekly_report_table — табличный отчёт за неделю (только Denis_Arger, ЛС)."""
+        user = update.effective_user
+        tg_username = user.username if user else None
+        if not tg_username or tg_username.lstrip("@").lower() != "denis_arger":
+            await update.message.reply_text("Команда недоступна.")
+            return
+        chat = update.effective_chat
+        if chat is not None and chat.type != "private":
+            await update.message.reply_text("Команда доступна только в личном чате.")
+            return
+        denis = next(
+            (
+                u
+                for u in self.arr_of_users
+                if (u.get("tgName") or "").lstrip("@").lower() == "denis_arger"
+            ),
+            None,
+        )
+        if not denis:
+            await update.message.reply_text("Не найден в users.json.")
+            return
+        try:
+            report, start_local, end_local = self._collect_weekly_report(
+                exclude_login=denis.get("repName")
+            )
+            text = self._build_weekly_report_table(report, start_local, end_local)
+            await update.message.reply_text(f"<pre>{text}</pre>", parse_mode="HTML")
+
+            csv_content = self._build_weekly_report_csv(report)
+            from telegram import BufferedInputFile
+
+            await update.message.reply_document(
+                document=BufferedInputFile(
+                    csv_content.encode("utf-8"),
+                    filename=(
+                        f"weekly_report_{start_local.strftime('%d%m')}"
+                        f"_{end_local.strftime('%d%m')}.csv"
+                    ),
+                ),
+                caption="CSV для открытия в Excel и печати",
+            )
+
+            pdf_content = self._build_weekly_report_pdf(report, start_local, end_local)
+            await update.message.reply_document(
+                document=BufferedInputFile(
+                    pdf_content,
+                    filename=(
+                        f"weekly_report_{start_local.strftime('%d%m')}"
+                        f"_{end_local.strftime('%d%m')}.pdf"
+                    ),
+                ),
+                caption="PDF для печати",
+            )
+        except Exception:
+            logger.exception("/weekly_report_table failed")
+            await update.message.reply_text("Ошибка при сборе данных. Попробуйте позже.")
+
     async def _handle_weekly_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /weekly_report — отчёт за неделю, только для Denis_Arger в ЛС."""
         user = update.effective_user
@@ -1211,6 +1426,7 @@ class TelegramWebhookBot:
         app = Application.builder().token(self.TOKEN).build()
         app.add_handler(CommandHandler("check", self._handle_check))
         app.add_handler(CommandHandler("weekly_report", self._handle_weekly_report))
+        app.add_handler(CommandHandler("weekly_report_table", self._handle_weekly_report_table))
         app.add_handler(CommandHandler("birthday", self._handle_birthday))
         return app
 
