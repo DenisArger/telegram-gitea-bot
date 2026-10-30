@@ -387,6 +387,38 @@ class TelegramWebhookBot:
     def _gitea_get_pr(self, owner: str, repo: str, number: int) -> Optional[Dict]:
         return self._gitea_request("GET", f"/repos/{owner}/{repo}/pulls/{number}")
 
+    def _gitea_list_branches(self, owner: str, repo: str) -> List[str]:
+        """Возвращает список имён всех веток репозитория."""
+        branches = []
+        page = 1
+        while True:
+            data = self._gitea_request(
+                "GET",
+                f"/repos/{owner}/{repo}/branches",
+                params={"page": page, "limit": 50},
+            )
+            if not data:
+                break
+            for b in data:
+                name = self._clean_branch_name(b.get("name"))
+                if name:
+                    branches.append(name)
+            if len(data) < 50:
+                break
+            page += 1
+        return branches
+
+    @staticmethod
+    def _clean_branch_name(name: str) -> Optional[str]:
+        """Нормализует имя ветки: убирает refs/heads/ префикс, пропускает refs/pull/*/head."""
+        if not name:
+            return None
+        if name.startswith("refs/pull/"):
+            return None
+        if name.startswith("refs/heads/"):
+            name = name[len("refs/heads/"):]
+        return name or None
+
     def _gitea_get_pr_reviews(self, owner: str, repo: str, number: int) -> List[Dict]:
         data = self._gitea_request(
             "GET", f"/repos/{owner}/{repo}/pulls/{number}/reviews"
@@ -1010,6 +1042,8 @@ class TelegramWebhookBot:
             }
 
         repos = self._normalized_repositories()
+        repos_with_pr = set()
+        pr_branches_by_repo = {}
         for full_name in repos:
             parsed = self._extract_owner_repo(full_name)
             if not parsed:
@@ -1022,15 +1056,13 @@ class TelegramWebhookBot:
                 continue
             for pr in prs:
                 author = (pr.get("user") or {}).get("login")
-                if author not in report:
-                    continue
                 number = pr.get("number")
                 url = pr.get("html_url") or f"{self.gitea_url}/{owner}/{repo}/pull/{number}"
                 repo_full = (
                     (pr.get("base") or {}).get("repo", {}).get("full_name")
                     or f"{owner}/{repo}"
                 )
-                entry = report[author]
+                repos_with_pr.add(repo_full)
 
                 created_dt = self._parse_iso(pr.get("created_at"))
                 updated_dt = self._parse_iso(pr.get("updated_at"))
@@ -1057,18 +1089,30 @@ class TelegramWebhookBot:
                     ),
                 }
 
-                if self._in_period(created_dt, start_utc, end_utc):
-                    item["date"] = created_dt.astimezone(local_tz).strftime("%d.%m")
-                    entry["opened"].append(dict(item))
-                if merged_dt and self._in_period(merged_dt, start_utc, end_utc):
-                    item["date"] = merged_dt.astimezone(local_tz).strftime("%d.%m")
-                    entry["merged"].append(dict(item))
-                elif closed_dt and state == "closed" and self._in_period(closed_dt, start_utc, end_utc):
-                    item["date"] = closed_dt.astimezone(local_tz).strftime("%d.%m")
-                    entry["closed"].append(dict(item))
+                if touched:
+                    branch = item["branch"]
+                    if repo_full not in pr_branches_by_repo:
+                        pr_branches_by_repo[repo_full] = set()
+                    pr_branches_by_repo[repo_full].add(branch)
+
+                # Opened / merged / closed привязываем к автору PR (если он в списке)
+                if author in report:
+                    entry = report[author]
+                    if self._in_period(created_dt, start_utc, end_utc):
+                        item["date"] = created_dt.astimezone(local_tz).strftime("%d.%m")
+                        entry["opened"].append(dict(item))
+                    if merged_dt and self._in_period(merged_dt, start_utc, end_utc):
+                        item["date"] = merged_dt.astimezone(local_tz).strftime("%d.%m")
+                        entry["merged"].append(dict(item))
+                    elif closed_dt and state == "closed" and self._in_period(closed_dt, start_utc, end_utc):
+                        item["date"] = closed_dt.astimezone(local_tz).strftime("%d.%m")
+                        entry["closed"].append(dict(item))
 
                 if not touched:
                     continue
+
+                # Ревью и комментарии собираем для ВСЕХ актуальных PR,
+                # привязывая к ревьюеру (а не к автору PR)
                 try:
                     reviews = self._gitea_get_pr_reviews(owner, repo, number)
                     comments = self._gitea_get_pr_comments(owner, repo, number)
@@ -1081,6 +1125,7 @@ class TelegramWebhookBot:
                     if r_login in report:
                         submitted_at = r.get("submitted_at")
                         if self._in_period(self._parse_iso(submitted_at), start_utc, end_utc):
+                            entry = report[r_login]
                             entry["reviews"].append({
                                 "number": number,
                                 "url": url,
@@ -1095,6 +1140,7 @@ class TelegramWebhookBot:
                     if c_login in report:
                         created_at = c.get("created_at")
                         if self._in_period(self._parse_iso(created_at), start_utc, end_utc):
+                            entry = report[c_login]
                             entry["reviews"].append({
                                 "number": number,
                                 "url": url,
@@ -1103,45 +1149,327 @@ class TelegramWebhookBot:
                                 "type": "комментарий",
                                 "date": self._parse_iso(created_at).astimezone(local_tz).strftime("%d.%m") if created_at else "",
                             })
-        return report, start_local, end_local
+        self._last_report_repos = set(repos)
+        self._last_report_pr_branches = {k: list(v) for k, v in pr_branches_by_repo.items()}
 
-    def _collect_commits_in_period(self, start_utc, end_utc):
-        """Собирает коммиты за период по всем репозиториям."""
-        commits = []
-        repos = self._normalized_repositories()
+        # Также собираем все ветки репозиториев (не только из touched-PR),
+        # чтобы коммиты из не-PR веток тоже попадали в отчёт
+        all_branches_by_repo = {}
+        for full_name, branches in pr_branches_by_repo.items():
+            cleaned = {self._clean_branch_name(b) for b in branches}
+            all_branches_by_repo[full_name] = {b for b in cleaned if b}
         for full_name in repos:
             parsed = self._extract_owner_repo(full_name)
             if not parsed:
                 continue
             owner, repo = parsed
+            if full_name not in all_branches_by_repo:
+                all_branches_by_repo[full_name] = set()
             try:
-                data = self._gitea_request(
-                    "GET",
-                    f"/repos/{owner}/{repo}/commits",
-                    params={
-                        "since": start_utc.isoformat(),
-                        "until": end_utc.isoformat(),
-                        "page": 1,
-                        "limit": 50,
-                    },
-                )
+                branches = self._gitea_list_branches(owner, repo)
             except Exception:
-                logger.exception("Failed to list commits for %s/%s", owner, repo)
+                logger.exception("Failed to list branches for %s/%s", owner, repo)
                 continue
-            if not data:
+            all_branches_by_repo[full_name].update(branches)
+        self._last_report_all_branches = {k: list(v) for k, v in all_branches_by_repo.items()}
+        return report, start_local, end_local
+
+    def _collect_commits_in_period(self, start_utc, end_utc, repos=None, pr_branches=None):
+        """Собирает коммиты за период по репозиториям и всем веткам
+        (с пагинацией, фильтрация по датам в Python, дедупликация по SHA).
+        Если передан `repos` — собирает только из этих репозиториев."""
+        from dateutil import parser as dateparser
+        import time as _time
+
+        commits = []
+        seen_sha = set()
+        repo_list = repos if repos else getattr(self, '_last_report_repos', None) or self._normalized_repositories()
+        _start_time = _time.monotonic()
+        _TIME_LIMIT = 300.0  # секунды на сбор коммитов
+        for full_name in repo_list:
+            if _time.monotonic() - _start_time > _TIME_LIMIT:
+                logger.warning("Commits collection time limit reached, stopping early")
+                break
+            parsed = self._extract_owner_repo(full_name)
+            if not parsed:
                 continue
-            for c in data:
-                commit = c.get("commit") or {}
-                author = commit.get("author") or {}
-                commits.append({
-                    "repo": full_name,
-                    "sha": c.get("sha", "")[:7],
-                    "message": (commit.get("message") or "").split("\n")[0],
-                    "author": author.get("name") or (c.get("author") or {}).get("login") or "?",
-                    "date": commit.get("author", {}).get("date") or c.get("commit", {}).get("committer", {}).get("date"),
-                    "url": c.get("html_url") or f"{self.gitea_url}/{full_name}/commit/{c.get('sha','')}",
-                })
+            owner, repo = parsed
+            if pr_branches and full_name in pr_branches:
+                branches = pr_branches[full_name]
+            else:
+                branches = [""]
+            for branch in branches:
+                page = 1
+                while True:
+                    try:
+                        params = {
+                            "page": page,
+                            "limit": 50,
+                        }
+                        if branch:
+                            params["sha"] = branch
+                        data = self._gitea_request(
+                            "GET",
+                            f"/repos/{owner}/{repo}/commits",
+                            params=params,
+                        )
+                    except Exception:
+                        logger.exception("Failed to list commits for %s/%s branch %s", owner, repo, branch)
+                        break
+                    if not data:
+                        break
+                    for c in data:
+                        commit = c.get("commit") or {}
+                        commit_author = commit.get("author") or {}
+                        date_str = commit_author.get("date") or c.get("commit", {}).get("committer", {}).get("date")
+                        if not date_str:
+                            continue
+                        try:
+                            dt = dateparser.isoparse(date_str)
+                        except Exception:
+                            continue
+                        if not (start_utc <= dt <= end_utc):
+                            continue
+                        sha = c.get("sha", "")
+                        if sha in seen_sha:
+                            continue
+                        seen_sha.add(sha)
+                        commits.append({
+                            "repo": full_name,
+                            "branch": self._clean_branch_name(branch) or "(default)",
+                            "sha": sha[:7],
+                            "message": (commit.get("message") or "").split("\n")[0],
+                            "author": (c.get("author") or {}).get("login") or commit_author.get("name") or "?",
+                            "author_email": commit_author.get("email") or (c.get("author") or {}).get("email") or "",
+                            "date": date_str,
+                            "url": c.get("html_url") or f"{self.gitea_url}/{full_name}/commit/{sha}",
+                        })
+                    if len(data) < 50:
+                        break
+                    page += 1
         return commits
+
+    def _count_commits_by_user(self, commits: List[Dict]) -> Dict[str, int]:
+        """Подсчитывает количество коммитов по каждому сотруднику из users.json.
+
+        Сопоставление по логину, TG-имени, email и частям ФИО (в любом порядке,
+        с транслитерацией кириллицы).
+        """
+        counts = {u.get("repName"): 0 for u in self.arr_of_users if u.get("repName")}
+
+        _CYRILLIC = {
+            "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+            "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+            "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+            "ф": "f",             "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+            "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+        }
+
+        def _translit(name: str) -> str:
+            out = []
+            for ch in str(name).lower():
+                out.append(_CYRILLIC.get(ch, ch))
+            return "".join(out)
+
+        def _norm(name: str) -> str:
+            return "".join(_translit(name or "").split())
+
+        # Нормализованные ключи -> login
+        key_to_login: Dict[str, str] = {}
+        # Части ФИО -> login (для нечёткого совпадения)
+        parts_to_login: Dict[str, str] = {}
+
+        def _split_camel(name: str):
+            """Разбивает 'RomanProtchenko' -> ['roman', 'prochenko']."""
+            parts = re.findall(r'[A-Z]?[a-z]+|[a-z]+', name)
+            return [p for p in parts if p]
+
+        for u in self.arr_of_users:
+            login = u.get("repName")
+            tg = u.get("tgName") or ""
+            if not login:
+                continue
+            n_login = _norm(login)
+            key_to_login[n_login] = login
+            parts_to_login[n_login] = login
+            for part in _split_camel(login):
+                parts_to_login[_norm(part)] = login
+            if tg:
+                n_tg = _norm(tg)
+                key_to_login[n_tg] = login
+                parts_to_login[n_tg] = login
+                for part in _split_camel(tg):
+                    parts_to_login[_norm(part)] = login
+
+        for c in commits:
+            author = c.get("author") or ""
+            email = c.get("author_email") or ""
+            if isinstance(author, dict):
+                author = author.get("name") or author.get("username") or ""
+            author = str(author).strip()
+            if not author:
+                continue
+
+            # 1. Точное совпадение по нормализованному имени или TG
+            key = _norm(author)
+            if key in key_to_login:
+                counts[key_to_login[key]] += 1
+                continue
+
+            # 2. По email (часть до @)
+            if email and "@" in email:
+                email_key = _norm(email.split("@")[0])
+                if email_key in key_to_login:
+                    counts[key_to_login[email_key]] += 1
+                    continue
+
+            # 3. Нечёткое: любая часть ФИО совпадает с частью логина/TG
+            author_parts = [p for p in str(author).lower().split() if p]
+            matched = False
+            for part in author_parts:
+                np = _norm(part)
+                if np in parts_to_login:
+                    counts[parts_to_login[np]] += 1
+                    matched = True
+                    break
+            if matched:
+                continue
+
+        return counts
+
+    def _match_commit_author_to_user(self, commit: Dict) -> Optional[str]:
+        """Определяет сотрудника (repName из users.json) по автору коммита.
+
+        Сопоставление по логину, TG-имени, email и частям ФИО (в любом порядке,
+        с транслитерацией кириллицы). Возвращает repName или None.
+        """
+        if not self.arr_of_users:
+            return None
+        author = commit.get("author") or ""
+        email = commit.get("author_email") or ""
+        if isinstance(author, dict):
+            author = author.get("name") or author.get("username") or ""
+        author = str(author).strip()
+        if not author:
+            return None
+
+        _CYRILLIC = {
+            "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+            "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+            "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+            "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+            "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+        }
+
+        def _translit(name: str) -> str:
+            return "".join(_CYRILLIC.get(ch, ch) for ch in str(name).lower())
+
+        def _norm(name: str) -> str:
+            return "".join(_translit(name or "").split())
+
+        def _split_camel(name: str):
+            parts = re.findall(r'[A-Z]?[a-z]+|[a-z]+', name)
+            return [p for p in parts if p]
+
+        key_to_login: Dict[str, str] = {}
+        parts_to_login: Dict[str, str] = {}
+
+        for u in self.arr_of_users:
+            login = u.get("repName")
+            tg = u.get("tgName") or ""
+            if not login:
+                continue
+            n_login = _norm(login)
+            key_to_login[n_login] = login
+            parts_to_login[n_login] = login
+            for part in _split_camel(login):
+                parts_to_login[_norm(part)] = login
+            if tg:
+                n_tg = _norm(tg)
+                key_to_login[n_tg] = login
+                parts_to_login[n_tg] = login
+                for part in _split_camel(tg):
+                    parts_to_login[_norm(part)] = login
+
+        # 1. Точное совпадение по нормализованному имени или TG
+        key = _norm(author)
+        if key in key_to_login:
+            return key_to_login[key]
+
+        # 2. По email (часть до @)
+        if email and "@" in email:
+            email_key = _norm(email.split("@")[0])
+            if email_key in key_to_login:
+                return key_to_login[email_key]
+
+        # 3. Нечёткое: любая часть ФИО совпадает с частью логина/TG
+        author_parts = [p for p in str(author).lower().split() if p]
+        for part in author_parts:
+            np = _norm(part)
+            if np in parts_to_login:
+                return parts_to_login[np]
+
+        return None
+
+    def _match_branch_to_user(self, branch: str) -> Optional[str]:
+        """Определяет сотрудника по названию ветки (feat-kharlan-242 -> AntonKharlan)."""
+        if not branch or not self.arr_of_users:
+            return None
+
+        _CYRILLIC = {
+            "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+            "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+            "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+            "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+            "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+        }
+
+        def _translit(name: str) -> str:
+            return "".join(_CYRILLIC.get(ch, ch) for ch in str(name).lower())
+
+        def _norm(name: str) -> str:
+            return "".join(_translit(name or "").split())
+
+        def _split_camel(name: str):
+            parts = re.findall(r'[A-Z]?[a-z]+|[a-z]+', name)
+            return [p for p in parts if p]
+
+        # Ключевые слова каждого сотрудника
+        user_keys = []
+        for u in self.arr_of_users:
+            login = u.get("repName") or ""
+            tg = u.get("tgName") or ""
+            keys = set()
+            if login:
+                keys.add(_norm(login).lower())
+                for part in _split_camel(login):
+                    keys.add(_norm(part).lower())
+            if tg:
+                keys.add(_norm(tg).lower())
+                for part in _split_camel(tg):
+                    keys.add(_norm(part).lower())
+            user_keys.append((u.get("repName"), keys))
+
+        # Части названия ветки
+        parts = re.findall(r'[A-Za-zА-Яа-яЁё]+', branch)
+        branch_keys = set()
+        for p in parts:
+            np = _norm(p).lower()
+            if np:
+                branch_keys.add(np)
+
+        # Ищем совпадение
+        for login, keys in user_keys:
+            for bk in branch_keys:
+                if len(bk) < 3:
+                    continue
+                if bk in keys:
+                    return login
+                for k in keys:
+                    if len(k) > 2 and (bk in k or k in bk):
+                        return login
+
+        return None
 
     @staticmethod
     def _report_pr_line(item: Dict, suffix: str = "") -> str:
@@ -1284,11 +1612,38 @@ class TelegramWebhookBot:
             Spacer,
         )
         from reportlab.lib.units import mm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
         from io import BytesIO
+
+        pdfmetrics.registerFont(
+            TTFont("DejaVuSans", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+        )
+        pdfmetrics.registerFont(
+            TTFont("DejaVuSans-Bold", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+        )
+        pdfmetrics.registerFont(
+            TTFont("DejaVuSans-Oblique", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf")
+        )
+        pdfmetrics.registerFont(
+            TTFont(
+                "DejaVuSans-BoldOblique",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+            )
+        )
+        pdfmetrics.registerFontFamily(
+            "DejaVuSans",
+            normal="DejaVuSans",
+            bold="DejaVuSans-Bold",
+            italic="DejaVuSans-Oblique",
+            boldItalic="DejaVuSans-BoldOblique",
+        )
 
         styles = getSampleStyleSheet()
         title_style = styles["Heading1"]
+        title_style.fontName = "DejaVuSans-Bold"
         subtitle_style = styles["Normal"]
+        subtitle_style.fontName = "DejaVuSans"
 
         buffer = BytesIO()
         doc = SimpleDocTemplate(
@@ -1333,9 +1688,9 @@ class TelegramWebhookBot:
         style = [
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTNAME", (0, 0), (-1, 0), "DejaVuSans-Bold"),
             ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+            ("FONTNAME", (0, 1), (-1, -1), "DejaVuSans"),
             ("ALIGN", (1, 0), (-1, -1), "CENTER"),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
@@ -1373,6 +1728,32 @@ class TelegramWebhookBot:
         lines.append(sep)
         return "\n".join(lines)
 
+    @staticmethod
+    def _split_message(text: str, limit: int = 4000) -> List[str]:
+        """Разбивает длинное сообщение на части не более limit символов,
+        не разрывая HTML-теги и строки."""
+        if len(text) <= limit:
+            return [text]
+        parts = []
+        remaining = text
+        while remaining:
+            if len(remaining) <= limit:
+                parts.append(remaining)
+                break
+            cut = remaining.rfind("\n", 0, limit)
+            if cut == -1:
+                cut = limit
+            # Не режем посреди HTML-тега: если на позиции cut нет переноса или '>',
+            # ищем ближайший '>' или '\n' вперед, но не дальше limit + допуск
+            max_cut = min(len(remaining), cut + 200)
+            while cut < max_cut and remaining[cut] not in ("\n", ">"):
+                cut += 1
+            if cut < len(remaining) and remaining[cut] == ">":
+                cut += 1
+            parts.append(remaining[:cut])
+            remaining = remaining[cut:].lstrip("\n")
+        return parts
+
     def _build_detailed_weekly_report(self, report, start_local, end_local):
         """Детальный текстовый отчёт по макету (таблицы, ссылки на Gitea)."""
         lines = []
@@ -1403,6 +1784,14 @@ class TelegramWebhookBot:
 
         # ----- 2. Активность сотрудников -----
         lines.append("2. Активность сотрудников")
+        try:
+            start_utc = start_local.astimezone(timezone.utc)
+            end_utc = end_local.astimezone(timezone.utc)
+            commits = self._collect_commits_in_period(start_utc, end_utc, pr_branches=self._last_report_all_branches)
+        except Exception:
+            logger.exception("Failed to collect commits")
+            commits = []
+        commit_counts = self._count_commits_by_user(commits)
         emp_rows = []
         for entry in report.values():
             name = f"{entry['tg']} / {entry['login']}"
@@ -1411,7 +1800,7 @@ class TelegramWebhookBot:
                 str(len(entry["opened"])),
                 str(len(entry["reviews"])),
                 str(len(entry["merged"])),
-                "—",
+                str(commit_counts.get(entry["login"], 0)),
             ])
         lines.append(self._ascii_table(
             ["Сотрудник", "PR", "Ревью", "Merge", "Коммиты"], emp_rows
@@ -1449,20 +1838,29 @@ class TelegramWebhookBot:
         try:
             start_utc = start_local.astimezone(timezone.utc)
             end_utc = end_local.astimezone(timezone.utc)
-            commits = self._collect_commits_in_period(start_utc, end_utc)
+            commits = self._collect_commits_in_period(start_utc, end_utc, pr_branches=self._last_report_all_branches)
         except Exception:
             logger.exception("Failed to collect commits")
             commits = []
         if commits:
-            comm_rows = []
-            for c in sorted(commits, key=lambda x: x.get("date") or ""):
-                dt = c.get("date") or ""
-                try:
-                    dt_fmt = datetime.fromisoformat(dt.replace("Z", "+00:00")).astimezone(start_local.tzinfo).strftime("%d.%m %H:%M")
-                except Exception:
-                    dt_fmt = dt
-                comm_rows.append([dt_fmt, c["author"], c["message"]])
-            lines.append(self._ascii_table(["Дата", "Сотрудник", "Коммит"], comm_rows))
+            # Агрегация по проекту / ветке / сотруднику
+            # кириллица и латиница сводятся к одному сотруднику
+            # приоритет — автору ветки (по названию ветки), затем — автору коммита
+            from collections import Counter
+            agg = Counter()
+            for c in commits:
+                proj = c["repo"].split("/")[-1] if "/" in c["repo"] else c["repo"]
+                branch = c.get("branch") or "(default)"
+                author = self._match_branch_to_user(branch)
+                if not author:
+                    author = self._match_commit_author_to_user(c) or c.get("author") or "?"
+                agg[(proj, branch, author)] += 1
+            agg_rows = []
+            for (proj, branch, author), cnt in sorted(agg.items(), key=lambda x: (-x[1], x[0])):
+                agg_rows.append([proj, branch, author, str(cnt)])
+            lines.append(self._ascii_table(
+                ["Проект", "Ветка", "Сотрудник", "Кол-во"], agg_rows
+            ))
         else:
             lines.append("Нет данных.")
         lines.append("")
@@ -1489,7 +1887,6 @@ class TelegramWebhookBot:
             for entry, it in open_prs:
                 link = f'<a href="{it["url"]}">PR #{it["number"]}</a>'
                 lines.append(f"- {link} ожидает ревью.")
-        lines.append("Все данные в макете условные. В реальном отчёте записи будут содержать ссылки на Gitea.")
 
         return "\n".join(lines)
 
@@ -1506,12 +1903,38 @@ class TelegramWebhookBot:
             Paragraph,
             Spacer,
         )
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
         from io import BytesIO
 
+        pdfmetrics.registerFont(
+            TTFont("DejaVuSans", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+        )
+        pdfmetrics.registerFont(
+            TTFont("DejaVuSans-Bold", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+        )
+        pdfmetrics.registerFont(
+            TTFont("DejaVuSans-Oblique", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf")
+        )
+        pdfmetrics.registerFont(
+            TTFont(
+                "DejaVuSans-BoldOblique",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+            )
+        )
+        pdfmetrics.registerFontFamily(
+            "DejaVuSans",
+            normal="DejaVuSans",
+            bold="DejaVuSans-Bold",
+            italic="DejaVuSans-Oblique",
+            boldItalic="DejaVuSans-BoldOblique",
+        )
+
         styles = getSampleStyleSheet()
-        h1 = ParagraphStyle("H1", parent=styles["Heading1"], fontSize=14, spaceAfter=6)
-        h2 = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=11, spaceBefore=8, spaceAfter=4)
+        h1 = ParagraphStyle("H1", parent=styles["Heading1"], fontSize=14, spaceAfter=6, fontName="DejaVuSans-Bold")
+        h2 = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=11, spaceBefore=8, spaceAfter=4, fontName="DejaVuSans-Bold")
         body = styles["Normal"]
+        body.fontName = "DejaVuSans"
 
         buffer = BytesIO()
         doc = SimpleDocTemplate(
@@ -1547,7 +1970,8 @@ class TelegramWebhookBot:
         stats_tbl.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTNAME", (0, 0), (-1, 0), "DejaVuSans-Bold"),
+            ("FONTNAME", (0, 1), (-1, -1), "DejaVuSans"),
             ("FONTSIZE", (0, 0), (-1, -1), 9),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#DCE6F1")]),
@@ -1558,6 +1982,14 @@ class TelegramWebhookBot:
 
         # 2. Активность сотрудников
         elements.append(Paragraph("2. Активность сотрудников", h2))
+        try:
+            start_utc = start_local.astimezone(timezone.utc)
+            end_utc = end_local.astimezone(timezone.utc)
+            commits = self._collect_commits_in_period(start_utc, end_utc, pr_branches=self._last_report_all_branches)
+        except Exception:
+            logger.exception("Failed to collect commits")
+            commits = []
+        commit_counts = self._count_commits_by_user(commits)
         emp_data = [["Сотрудник", "PR", "Ревью", "Merge", "Коммиты"]]
         for entry in report.values():
             emp_data.append([
@@ -1565,13 +1997,14 @@ class TelegramWebhookBot:
                 str(len(entry["opened"])),
                 str(len(entry["reviews"])),
                 str(len(entry["merged"])),
-                "—",
+                str(commit_counts.get(entry["login"], 0)),
             ])
         emp_tbl = Table(emp_data, repeatRows=1)
         emp_tbl.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTNAME", (0, 0), (-1, 0), "DejaVuSans-Bold"),
+            ("FONTNAME", (0, 1), (-1, -1), "DejaVuSans"),
             ("FONTSIZE", (0, 0), (-1, -1), 9),
             ("ALIGN", (1, 0), (-1, -1), "CENTER"),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
@@ -1608,29 +2041,46 @@ class TelegramWebhookBot:
         try:
             start_utc = start_local.astimezone(timezone.utc)
             end_utc = end_local.astimezone(timezone.utc)
-            commits = self._collect_commits_in_period(start_utc, end_utc)
+            commits = self._collect_commits_in_period(start_utc, end_utc, pr_branches=self._last_report_all_branches)
         except Exception:
             logger.exception("Failed to collect commits")
             commits = []
         if commits:
-            comm_data = [["Дата", "Сотрудник", "Коммит"]]
-            for c in sorted(commits, key=lambda x: x.get("date") or ""):
-                dt = c.get("date") or ""
-                try:
-                    dt_fmt = datetime.fromisoformat(dt.replace("Z", "+00:00")).astimezone(start_local.tzinfo).strftime("%d.%m %H:%M")
-                except Exception:
-                    dt_fmt = dt
-                comm_data.append([dt_fmt, c["author"], c["message"]])
-            comm_tbl = Table(comm_data, repeatRows=1, colWidths=[25 * mm, 35 * mm, 80 * mm])
+            from collections import Counter
+            agg = Counter()
+            for c in commits:
+                proj = c["repo"].split("/")[-1] if "/" in c["repo"] else c["repo"]
+                branch = c.get("branch") or "(default)"
+                # приоритет — автору ветки (по названию ветки), затем — автору коммита
+                author = self._match_branch_to_user(branch)
+                if not author:
+                    author = self._match_commit_author_to_user(c) or c.get("author") or "?"
+                agg[(author, proj, branch)] += 1
+            comm_data = [["Сотрудник", "Проект", "Ветка", "Кол-во"]]
+            cell = ParagraphStyle("cell", parent=body, fontSize=8, leading=10, splitLongWords=1)
+            cell_bold = ParagraphStyle("cellBold", parent=cell, fontName="DejaVuSans-Bold")
+            header_row = [Paragraph("Сотрудник", cell_bold), Paragraph("Проект", cell_bold),
+                          Paragraph("Ветка", cell_bold), Paragraph("Кол-во", cell_bold)]
+            comm_data[0] = header_row
+            for (author, proj, branch), cnt in sorted(agg.items(), key=lambda x: (-x[1], x[0])):
+                comm_data.append([
+                    Paragraph(author, cell),
+                    Paragraph(proj, cell),
+                    Paragraph(branch, cell),
+                    Paragraph(str(cnt), cell),
+                ])
+            comm_tbl = Table(comm_data, repeatRows=1, colWidths=[30 * mm, 25 * mm, 30 * mm, 12 * mm])
             comm_tbl.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTNAME", (0, 0), (-1, 0), "DejaVuSans-Bold"),
                 ("FONTSIZE", (0, 0), (-1, -1), 8),
                 ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
                 ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#DCE6F1")]),
-                ("TOPPADDING", (0, 0), (-1, -1), 3),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ALIGN", (3, 0), (3, -1), "CENTER"),
             ]))
             elements.append(comm_tbl)
         else:
@@ -1653,7 +2103,6 @@ class TelegramWebhookBot:
         if open_prs:
             for entry, it in open_prs:
                 elements.append(Paragraph(f"• PR #{it['number']} ожидает ревью.", body))
-        elements.append(Paragraph("Все данные в макете условные. В реальном отчёте записи будут содержать ссылки на Gitea.", body))
 
         doc.build(elements)
         return buffer.getvalue()
@@ -1687,33 +2136,52 @@ class TelegramWebhookBot:
                 exclude_login=denis.get("repName")
             )
             text = self._build_weekly_report_table(report, start_local, end_local)
-            await update.message.reply_text(f"<pre>{text}</pre>", parse_mode="HTML")
+            for part in self._split_message(text):
+                await update.message.reply_text(part, parse_mode="HTML")
 
-            csv_content = self._build_weekly_report_csv(report)
             from telegram import BufferedInputFile
 
-            await update.message.reply_document(
-                document=BufferedInputFile(
-                    csv_content.encode("utf-8"),
-                    filename=(
-                        f"weekly_report_{start_local.strftime('%d%m')}"
-                        f"_{end_local.strftime('%d%m')}.csv"
+            try:
+                csv_content = self._build_weekly_report_csv(report)
+                await update.message.reply_document(
+                    document=BufferedInputFile(
+                        csv_content.encode("utf-8"),
+                        filename=(
+                            f"weekly_report_{start_local.strftime('%d%m')}"
+                            f"_{end_local.strftime('%d%m')}.csv"
+                        ),
                     ),
-                ),
-                caption="CSV для открытия в Excel и печати",
-            )
+                    caption="CSV для открытия в Excel и печати",
+                )
+            except Exception:
+                logger.exception("Failed to send weekly CSV")
 
-            pdf_content = self._build_weekly_report_pdf(report, start_local, end_local)
-            await update.message.reply_document(
-                document=BufferedInputFile(
-                    pdf_content,
-                    filename=(
-                        f"weekly_report_{start_local.strftime('%d%m')}"
-                        f"_{end_local.strftime('%d%m')}.pdf"
-                    ),
-                ),
-                caption="PDF для печати",
-            )
+            try:
+                import tempfile
+                import os
+
+                pdf_content = self._build_weekly_report_pdf(report, start_local, end_local)
+                tmp = tempfile.NamedTemporaryFile(
+                    suffix=".pdf", delete=False,
+                    prefix=f"weekly_report_{start_local.strftime('%d%m')}_",
+                )
+                tmp.write(pdf_content)
+                tmp.close()
+                try:
+                    with open(tmp.name, "rb") as f:
+                        await context.bot.send_document(
+                            chat_id=update.effective_chat.id,
+                            document=f,
+                            filename=os.path.basename(tmp.name),
+                            caption="PDF для печати",
+                        )
+                finally:
+                    try:
+                        os.unlink(tmp.name)
+                    except Exception:
+                        pass
+            except Exception:
+                logger.exception("Failed to send weekly PDF")
 
             try:
                 await status_msg.delete()
@@ -1751,29 +2219,120 @@ class TelegramWebhookBot:
             report, start_local, end_local = self._collect_weekly_report(
                 exclude_login=denis.get("repName")
             )
-            text = self._build_detailed_weekly_report(report, start_local, end_local)
-            await update.message.reply_text(f"<pre>{text}</pre>", parse_mode="HTML")
+            await status_msg.edit_text("Собираю коммиты из всех веток, это может занять до 5 минут…")
 
-            from telegram import BufferedInputFile
+            # Фоновая задача: обновляем сообщение о статусе каждые 25 секунд
+            status_stop = asyncio.Event()
 
-            pdf_content = self._build_detailed_weekly_report_pdf(report, start_local, end_local)
-            await update.message.reply_document(
-                document=BufferedInputFile(
-                    pdf_content,
-                    filename=(
-                        f"weekly_report_detailed_{start_local.strftime('%d%m')}"
-                        f"_{end_local.strftime('%d%m')}.pdf"
-                    ),
-                ),
-                caption="Детальный PDF-отчёт для печати",
-            )
+            async def _status_loop():
+                dots = 0
+                while not status_stop.is_set():
+                    try:
+                        dots = (dots + 1) % 4
+                        await status_msg.edit_text(
+                            f"Собираю коммиты из всех веток{'.' * dots} "
+                            f"(это может занять до 5 минут)"
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        await asyncio.wait_for(status_stop.wait(), timeout=25.0)
+                    except asyncio.TimeoutError:
+                        pass
+
+            status_task = asyncio.create_task(_status_loop())
+
+            async def _build_and_send():
+                # PDF — отдельная отправка
+                import tempfile
+                import os
+                import asyncio as _asyncio
+
+                pdf_content = self._build_detailed_weekly_report_pdf(
+                    report, start_local, end_local
+                )
+                tmp = tempfile.NamedTemporaryFile(
+                    suffix=".pdf", delete=False,
+                    prefix=f"weekly_report_detailed_{start_local.strftime('%d%m')}_",
+                )
+                tmp.write(pdf_content)
+                tmp.close()
+
+                last_exc = None
+                try:
+                    for attempt in range(4):
+                        try:
+                            with open(tmp.name, "rb") as f:
+                                await context.bot.send_document(
+                                    chat_id=update.effective_chat.id,
+                                    document=f,
+                                    filename=os.path.basename(tmp.name),
+                                    caption="Детальный PDF-отчёт для печати",
+                                )
+                            break
+                        except Exception as exc:
+                            last_exc = exc
+                            logger.warning("Send PDF attempt %d failed: %s", attempt + 1, exc)
+                            if attempt < 3:
+                                await _asyncio.sleep(5 * (attempt + 1))
+                    else:
+                        raise last_exc
+                finally:
+                    try:
+                        os.unlink(tmp.name)
+                    except Exception:
+                        pass
+
+            await asyncio.wait_for(_build_and_send(), timeout=420.0)
+
+            status_stop.set()
+            try:
+                await status_task
+            except Exception:
+                pass
 
             try:
                 await status_msg.delete()
             except Exception:
                 pass
+        except asyncio.TimeoutError:
+            logger.exception("/weekly_report_detailed timed out")
+            try:
+                if status_stop is not None:
+                    status_stop.set()
+            except Exception:
+                pass
+            try:
+                if status_task is not None:
+                    await status_task
+            except Exception:
+                pass
+            try:
+                await update.message.reply_text(
+                    "Сбор данных занимает слишком много времени. "
+                    "Отправляю частичный результат…"
+                )
+                report, start_local, end_local = self._collect_weekly_report(
+                    exclude_login=denis.get("repName")
+                )
+                text = self._build_detailed_weekly_report(report, start_local, end_local)
+                for part in self._split_message(text):
+                    await update.message.reply_text(part, parse_mode="HTML")
+            except Exception:
+                logger.exception("Failed to send partial report")
+                await update.message.reply_text("Ошибка при сборе данных. Попробуйте позже.")
         except Exception:
             logger.exception("/weekly_report_detailed failed")
+            try:
+                if status_stop is not None:
+                    status_stop.set()
+            except Exception:
+                pass
+            try:
+                if status_task is not None:
+                    await status_task
+            except Exception:
+                pass
             await update.message.reply_text("Ошибка при сборе данных. Попробуйте позже.")
 
     async def _handle_weekly_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
