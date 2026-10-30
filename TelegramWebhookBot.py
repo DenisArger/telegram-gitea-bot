@@ -12,6 +12,7 @@ TelegramWebhookBot — принимает вебхуки от Gitea и тран�
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import html
 import hmac
@@ -1046,16 +1047,29 @@ class TelegramWebhookBot:
         repos = self._normalized_repositories()
         repos_with_pr = set()
         pr_branches_by_repo = {}
+        touched_prs = []
+        repo_infos = []
         for full_name in repos:
             parsed = self._extract_owner_repo(full_name)
             if not parsed:
                 continue
             owner, repo = parsed
+
+            repo_infos.append((full_name, owner, repo))
+
+        def fetch_repo_prs(repo_info):
+            full_name, owner, repo = repo_info
             try:
-                prs = self._gitea_list_all_prs(owner, repo)
+                return repo_info, self._gitea_list_all_prs(owner, repo)
             except Exception:
                 logger.exception("Failed to list PRs for %s/%s", owner, repo)
-                continue
+                return repo_info, []
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            repo_pr_results = list(executor.map(fetch_repo_prs, repo_infos))
+
+        for repo_info, prs in repo_pr_results:
+            _, owner, repo = repo_info
             for pr in prs:
                 author = (pr.get("user") or {}).get("login")
                 number = pr.get("number")
@@ -1113,44 +1127,59 @@ class TelegramWebhookBot:
                 if not touched:
                     continue
 
-                # Ревью и комментарии собираем для ВСЕХ актуальных PR,
-                # привязывая к ревьюеру (а не к автору PR)
-                try:
-                    reviews = self._gitea_get_pr_reviews(owner, repo, number)
-                    comments = self._gitea_get_pr_comments(owner, repo, number)
-                except Exception:
-                    logger.exception("Failed to fetch activity for PR #%s", number)
-                    continue
-                for r in reviews or []:
-                    ru = r.get("user") or {}
-                    r_login = ru.get("login")
-                    if r_login in report:
-                        submitted_at = r.get("submitted_at")
-                        if self._in_period(self._parse_iso(submitted_at), start_utc, end_utc):
-                            entry = report[r_login]
-                            entry["reviews"].append({
-                                "number": number,
-                                "url": url,
-                                "repo": repo_full,
-                                "branch": item["branch"],
-                                "type": (r.get("state") or "review"),
-                                "date": self._parse_iso(submitted_at).astimezone(local_tz).strftime("%d.%m") if submitted_at else "",
-                            })
-                for c in comments or []:
-                    cu = c.get("user") or {}
-                    c_login = cu.get("login")
-                    if c_login in report:
-                        created_at = c.get("created_at")
-                        if self._in_period(self._parse_iso(created_at), start_utc, end_utc):
-                            entry = report[c_login]
-                            entry["reviews"].append({
-                                "number": number,
-                                "url": url,
-                                "repo": repo_full,
-                                "branch": item["branch"],
-                                "type": "комментарий",
-                                "date": self._parse_iso(created_at).astimezone(local_tz).strftime("%d.%m") if created_at else "",
-                            })
+                touched_prs.append((owner, repo, number, url, repo_full, item["branch"]))
+
+        # Получение ревью и комментариев — сетевые операции. Выполняем их
+        # ограниченным пулом, чтобы время ожидания не росло линейно с числом PR.
+        def fetch_pr_activity(pr_info):
+            owner, repo, number, _, _, _ = pr_info
+            try:
+                return (
+                    self._gitea_get_pr_reviews(owner, repo, number),
+                    self._gitea_get_pr_comments(owner, repo, number),
+                )
+            except Exception:
+                logger.exception("Failed to fetch activity for PR #%s", number)
+                return [], []
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            activity_results = list(executor.map(fetch_pr_activity, touched_prs))
+
+        for pr_info, (reviews, comments) in zip(touched_prs, activity_results):
+            owner, repo, number, url, repo_full, branch = pr_info
+            for r in reviews or []:
+                ru = r.get("user") or {}
+                r_login = ru.get("login")
+                if r_login in report:
+                    submitted_at = r.get("submitted_at")
+                    submitted_dt = self._parse_iso(submitted_at)
+                    if self._in_period(submitted_dt, start_utc, end_utc):
+                        entry = report[r_login]
+                        entry["reviews"].append({
+                            "number": number,
+                            "url": url,
+                            "repo": repo_full,
+                            "branch": branch,
+                            "type": (r.get("state") or "review"),
+                            "date": submitted_dt.astimezone(local_tz).strftime("%d.%m"),
+                        })
+
+            for c in comments or []:
+                cu = c.get("user") or {}
+                c_login = cu.get("login")
+                if c_login in report:
+                    created_at = c.get("created_at")
+                    created_dt = self._parse_iso(created_at)
+                    if self._in_period(created_dt, start_utc, end_utc):
+                        entry = report[c_login]
+                        entry["reviews"].append({
+                            "number": number,
+                            "url": url,
+                            "repo": repo_full,
+                            "branch": branch,
+                            "type": "комментарий",
+                            "date": created_dt.astimezone(local_tz).strftime("%d.%m"),
+                        })
         self._last_report_repos = set(repos)
         self._last_report_pr_branches = {k: list(v) for k, v in pr_branches_by_repo.items()}
 
@@ -1160,6 +1189,7 @@ class TelegramWebhookBot:
         for full_name, branches in pr_branches_by_repo.items():
             cleaned = {self._clean_branch_name(b) for b in branches}
             all_branches_by_repo[full_name] = {b for b in cleaned if b}
+        branch_repos = []
         for full_name in repos:
             parsed = self._extract_owner_repo(full_name)
             if not parsed:
@@ -1167,12 +1197,20 @@ class TelegramWebhookBot:
             owner, repo = parsed
             if full_name not in all_branches_by_repo:
                 all_branches_by_repo[full_name] = set()
+            branch_repos.append((full_name, owner, repo))
+
+        def fetch_branches(repo_info):
+            full_name, owner, repo = repo_info
             try:
-                branches = self._gitea_list_branches(owner, repo)
+                return full_name, self._gitea_list_branches(owner, repo)
             except Exception:
                 logger.exception("Failed to list branches for %s/%s", owner, repo)
-                continue
-            all_branches_by_repo[full_name].update(branches)
+                return full_name, []
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            branch_results = executor.map(fetch_branches, branch_repos)
+            for full_name, branches in branch_results:
+                all_branches_by_repo[full_name].update(branches)
         self._last_report_all_branches = {k: list(v) for k, v in all_branches_by_repo.items()}
         return report, start_local, end_local
 
@@ -1183,15 +1221,11 @@ class TelegramWebhookBot:
         from dateutil import parser as dateparser
         import time as _time
 
-        commits = []
-        seen_sha = set()
         repo_list = repos if repos else getattr(self, '_last_report_repos', None) or self._normalized_repositories()
         _start_time = _time.monotonic()
         _TIME_LIMIT = 300.0  # секунды на сбор коммитов
+        branch_jobs = []
         for full_name in repo_list:
-            if _time.monotonic() - _start_time > _TIME_LIMIT:
-                logger.warning("Commits collection time limit reached, stopping early")
-                break
             parsed = self._extract_owner_repo(full_name)
             if not parsed:
                 continue
@@ -1200,55 +1234,80 @@ class TelegramWebhookBot:
                 branches = pr_branches[full_name]
             else:
                 branches = [""]
-            for branch in branches:
-                page = 1
-                while True:
+            branch_jobs.extend((full_name, owner, repo, branch) for branch in branches)
+
+        def fetch_branch_commits(job):
+            full_name, owner, repo, branch = job
+            branch_commits = []
+            page = 1
+            while True:
+                if _time.monotonic() - _start_time > _TIME_LIMIT:
+                    logger.warning("Commits collection time limit reached, stopping early")
+                    break
+                try:
+                    params = {"page": page, "limit": 50}
+                    if branch:
+                        params["sha"] = branch
+                    data = self._gitea_request(
+                        "GET",
+                        f"/repos/{owner}/{repo}/commits",
+                        params=params,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to list commits for %s/%s branch %s",
+                        owner,
+                        repo,
+                        branch,
+                    )
+                    break
+                if not data:
+                    break
+
+                for c in data:
+                    commit = c.get("commit") or {}
+                    commit_author = commit.get("author") or {}
+                    date_str = (
+                        commit_author.get("date")
+                        or (commit.get("committer") or {}).get("date")
+                    )
+                    if not date_str:
+                        continue
                     try:
-                        params = {
-                            "page": page,
-                            "limit": 50,
-                        }
-                        if branch:
-                            params["sha"] = branch
-                        data = self._gitea_request(
-                            "GET",
-                            f"/repos/{owner}/{repo}/commits",
-                            params=params,
-                        )
+                        dt = dateparser.isoparse(date_str)
                     except Exception:
-                        logger.exception("Failed to list commits for %s/%s branch %s", owner, repo, branch)
-                        break
-                    if not data:
-                        break
-                    for c in data:
-                        commit = c.get("commit") or {}
-                        commit_author = commit.get("author") or {}
-                        date_str = commit_author.get("date") or c.get("commit", {}).get("committer", {}).get("date")
-                        if not date_str:
-                            continue
-                        try:
-                            dt = dateparser.isoparse(date_str)
-                        except Exception:
-                            continue
-                        if not (start_utc <= dt <= end_utc):
-                            continue
-                        sha = c.get("sha", "")
-                        if sha in seen_sha:
-                            continue
-                        seen_sha.add(sha)
-                        commits.append({
-                            "repo": full_name,
-                            "branch": self._clean_branch_name(branch) or "(default)",
-                            "sha": sha[:7],
-                            "message": (commit.get("message") or "").split("\n")[0],
-                            "author": (c.get("author") or {}).get("login") or commit_author.get("name") or "?",
-                            "author_email": commit_author.get("email") or (c.get("author") or {}).get("email") or "",
-                            "date": date_str,
-                            "url": c.get("html_url") or f"{self.gitea_url}/{full_name}/commit/{sha}",
-                        })
-                    if len(data) < 50:
-                        break
-                    page += 1
+                        continue
+                    if not (start_utc <= dt <= end_utc):
+                        continue
+
+                    sha = c.get("sha", "")
+                    branch_commits.append((sha, {
+                        "repo": full_name,
+                        "branch": self._clean_branch_name(branch) or "(default)",
+                        "sha": sha[:7],
+                        "message": (commit.get("message") or "").split("\n")[0],
+                        "author": (c.get("author") or {}).get("login") or commit_author.get("name") or "?",
+                        "author_email": commit_author.get("email") or (c.get("author") or {}).get("email") or "",
+                        "date": date_str,
+                        "url": c.get("html_url") or f"{self.gitea_url}/{full_name}/commit/{sha}",
+                    }))
+
+                if len(data) < 50:
+                    break
+                page += 1
+            return branch_commits
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            branch_results = executor.map(fetch_branch_commits, branch_jobs)
+            commits = []
+            seen_sha = set()
+            for branch_commits in branch_results:
+                for sha, commit in branch_commits:
+                    if sha in seen_sha:
+                        continue
+                    seen_sha.add(sha)
+                    commits.append(commit)
+
         return commits
 
     def _count_commits_by_user(self, commits: List[Dict]) -> Dict[str, int]:
