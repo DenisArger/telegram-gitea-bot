@@ -1982,8 +1982,7 @@ class TelegramWebhookBot:
         ]))
         elements.append(stats_tbl)
 
-        # 2. Активность сотрудников
-        elements.append(Paragraph("2. Активность сотрудников", h2))
+        # Коммиты собираем один раз и переиспользуем в разделах 2 и 4.
         try:
             start_utc = start_local.astimezone(timezone.utc)
             end_utc = end_local.astimezone(timezone.utc)
@@ -1992,6 +1991,9 @@ class TelegramWebhookBot:
             logger.exception("Failed to collect commits")
             commits = []
         commit_counts = self._count_commits_by_user(commits)
+
+        # 2. Активность сотрудников
+        elements.append(Paragraph("2. Активность сотрудников", h2))
         emp_data = [["Сотрудник", "PR", "Ревью", "Merge", "Коммиты"]]
         for entry in report.values():
             emp_data.append([
@@ -2040,13 +2042,6 @@ class TelegramWebhookBot:
 
         # 4. Коммиты
         elements.append(Paragraph("4. История коммитов", h2))
-        try:
-            start_utc = start_local.astimezone(timezone.utc)
-            end_utc = end_local.astimezone(timezone.utc)
-            commits = self._collect_commits_in_period(start_utc, end_utc, pr_branches=self._last_report_all_branches)
-        except Exception:
-            logger.exception("Failed to collect commits")
-            commits = []
         if commits:
             from collections import Counter
             agg = Counter()

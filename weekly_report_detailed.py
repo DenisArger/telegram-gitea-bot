@@ -13,11 +13,12 @@
 """
 
 import asyncio
+from functools import partial
 import logging
 import os
 import tempfile
 import time
-from typing import Awaitable, Callable, List, Optional
+from typing import Callable, List, Optional
 
 from telegram import Update
 from telegram.error import NetworkError, RetryAfter, TimedOut
@@ -25,12 +26,12 @@ from telegram.ext import ContextTypes
 
 logger = logging.getLogger(__name__)
 
-CollectWeeklyReport = Callable[..., Awaitable[tuple]]
+CollectWeeklyReport = Callable[..., tuple]
 BuildDetailedPDF = Callable[..., bytes]
 BuildDetailedText = Callable[..., str]
 SplitMessage = Callable[[str], List[str]]
 
-STATUS_UPDATE_INTERVAL = 30.0
+STATUS_UPDATE_INTERVAL = 5.0
 REPORT_TIMEOUT_SECONDS = 420.0
 PDF_BUILD_TIMEOUT_SECONDS = 120.0
 SEND_ATTEMPTS = 4
@@ -219,9 +220,16 @@ async def handle_weekly_report_detailed(
 
         # Сбор данных выполняется ровно один раз.
         collect_started_at = time.monotonic()
+        loop = asyncio.get_running_loop()
         try:
             report, start_local, end_local = await asyncio.wait_for(
-                collect_weekly_report(exclude_login=denis.get("repName")),
+                loop.run_in_executor(
+                    None,
+                    partial(
+                        collect_weekly_report,
+                        exclude_login=denis.get("repName"),
+                    ),
+                ),
                 timeout=REPORT_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
@@ -255,8 +263,6 @@ async def handle_weekly_report_detailed(
 
         # Синхронную генерацию PDF переносим в executor, чтобы не блокировать event loop.
         pdf_started_at = time.monotonic()
-        loop = asyncio.get_running_loop()
-
         pdf_content = await asyncio.wait_for(
             loop.run_in_executor(
                 None,
@@ -327,10 +333,11 @@ async def handle_weekly_report_detailed(
                     "Не удалось сформировать текстовую версию отчёта."
                 )
 
-    except Exception:
+    except Exception as exc:
         logger.exception("/weekly_report_detailed failed")
         await message.reply_text(
-            "Ошибка при формировании или отправке отчёта. Попробуйте позже."
+            "Ошибка при формировании или отправке отчёта: "
+            f"{type(exc).__name__}: {exc}"
         )
 
     finally:
