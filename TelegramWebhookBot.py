@@ -1098,6 +1098,44 @@ class TelegramWebhookBot:
                             })
         return report, start_local, end_local
 
+    def _collect_commits_in_period(self, start_utc, end_utc):
+        """Собирает коммиты за период по всем репозиториям."""
+        commits = []
+        repos = self._normalized_repositories()
+        for full_name in repos:
+            parsed = self._extract_owner_repo(full_name)
+            if not parsed:
+                continue
+            owner, repo = parsed
+            try:
+                data = self._gitea_request(
+                    "GET",
+                    f"/repos/{owner}/{repo}/commits",
+                    params={
+                        "since": start_utc.isoformat(),
+                        "until": end_utc.isoformat(),
+                        "page": 1,
+                        "limit": 50,
+                    },
+                )
+            except Exception:
+                logger.exception("Failed to list commits for %s/%s", owner, repo)
+                continue
+            if not data:
+                continue
+            for c in data:
+                commit = c.get("commit") or {}
+                author = commit.get("author") or {}
+                commits.append({
+                    "repo": full_name,
+                    "sha": c.get("sha", "")[:7],
+                    "message": (commit.get("message") or "").split("\n")[0],
+                    "author": author.get("name") or (c.get("author") or {}).get("login") or "?",
+                    "date": commit.get("author", {}).get("date") or c.get("commit", {}).get("committer", {}).get("date"),
+                    "url": c.get("html_url") or f"{self.gitea_url}/{full_name}/commit/{c.get('sha','')}",
+                })
+        return commits
+
     @staticmethod
     def _report_pr_line(item: Dict, suffix: str = "") -> str:
         branch = item.get("branch") or "?"
@@ -1304,6 +1342,275 @@ class TelegramWebhookBot:
         doc.build(elements)
         return buffer.getvalue()
 
+    def _build_detailed_weekly_report(self, report, start_local, end_local):
+        """Детальный текстовый отчёт по макету (общая статистика, сотрудники, проекты, коммиты, незавершённая работа)."""
+        lines = []
+        week_label = f"{start_local.strftime('%d %B')} — {end_local.strftime('%d %B %Y')}"
+        lines.append("Отчёт отдела разработки")
+        lines.append(week_label)
+        lines.append("")
+        lines.append("Демонстрационный макет")
+        lines.append("")
+
+        # ----- 1. Общая статистика -----
+        total_opened = sum(len(e["opened"]) for e in report.values())
+        total_merged = sum(len(e["merged"]) for e in report.values())
+        total_closed = sum(len(e["closed"]) for e in report.values())
+        total_reviews = sum(len(e["reviews"]) for e in report.values())
+        active_projects = len({it["repo"] for e in report.values() for it in e["opened"] + e["merged"] + e["closed"]})
+
+        lines.append("1. Общая статистика")
+        lines.append("Показатель\tЗначение")
+        lines.append(f"Открыто PR\t{total_opened}")
+        lines.append(f"Объединено PR\t{total_merged}")
+        lines.append(f"Закрыто без Merge\t{total_closed}")
+        lines.append(f"Проведено ревью\t{total_reviews}")
+        lines.append(f"Активных проектов\t{active_projects}")
+        lines.append("")
+
+        # ----- 2. Активность сотрудников -----
+        lines.append("2. Активность сотрудников")
+        lines.append("Сотрудник\tPR\tРевью\tMerge\tКоммиты")
+        for entry in report.values():
+            name = f"{entry['tg']} / {entry['login']}"
+            pr_cnt = len(entry["opened"])
+            rev_cnt = len(entry["reviews"])
+            merge_cnt = len(entry["merged"])
+            lines.append(f"{name}\t{pr_cnt}\t{rev_cnt}\t{merge_cnt}\t—")
+        lines.append("")
+
+        # ----- 3. Выполненные работы по проектам -----
+        lines.append("3. Выполненные работы по проектам")
+        projects = {}
+        for entry in report.values():
+            for it in entry["merged"] + entry["opened"]:
+                proj = it["repo"].split("/")[-1] if "/" in it["repo"] else it["repo"]
+                projects.setdefault(proj, []).append((entry, it))
+        if projects:
+            for proj, items in projects.items():
+                lines.append(proj)
+                seen = set()
+                for entry, it in items:
+                    key = (entry["login"], it["number"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    action = "объединён" if it in entry["merged"] else "открыт"
+                    lines.append(f"- {entry['tg']}: PR #{it['number']} ({it['branch']}) — {action}.")
+                lines.append("")
+        else:
+            lines.append("Нет данных.")
+            lines.append("")
+
+        # ----- 4. История коммитов -----
+        lines.append("4. История коммитов")
+        lines.append("Дата\tСотрудник\tКоммит")
+        try:
+            start_utc = start_local.astimezone(timezone.utc)
+            end_utc = end_local.astimezone(timezone.utc)
+            commits = self._collect_commits_in_period(start_utc, end_utc)
+        except Exception:
+            logger.exception("Failed to collect commits")
+            commits = []
+        if commits:
+            for c in sorted(commits, key=lambda x: x.get("date") or ""):
+                dt = c.get("date") or ""
+                try:
+                    dt_fmt = datetime.fromisoformat(dt.replace("Z", "+00:00")).astimezone(start_local.tzinfo).strftime("%d.%m %H:%M")
+                except Exception:
+                    dt_fmt = dt
+                lines.append(f"{dt_fmt}\t{c['author']}\t{c['message']}")
+        else:
+            lines.append("Нет данных.")
+        lines.append("")
+
+        # ----- 5. Незавершённая работа -----
+        lines.append("5. Незавершённая работа")
+        open_prs = []
+        for entry in report.values():
+            for it in entry["opened"]:
+                open_prs.append((entry, it))
+        if open_prs:
+            for entry, it in open_prs:
+                lines.append(f"- PR #{it['number']} — ожидает ревью / открыт, изменения не объединены ({it['repo']}).")
+        else:
+            lines.append("Нет незавершённой работы.")
+        lines.append("")
+
+        # ----- 6. Замечания и риски -----
+        lines.append("6. Замечания и риски")
+        if open_prs:
+            for entry, it in open_prs:
+                lines.append(f"- PR #{it['number']} ожидает ревью.")
+        lines.append("Все данные в макете условные. В реальном отчёте записи будут содержать ссылки на Gitea.")
+
+        return "\n".join(lines)
+
+    def _build_detailed_weekly_report_pdf(self, report, start_local, end_local):
+        """PDF-отчёт по детальному макету (reportlab)."""
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib import colors
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.platypus import (
+            SimpleDocTemplate,
+            Table,
+            TableStyle,
+            Paragraph,
+            Spacer,
+        )
+        from io import BytesIO
+
+        styles = getSampleStyleSheet()
+        h1 = ParagraphStyle("H1", parent=styles["Heading1"], fontSize=14, spaceAfter=6)
+        h2 = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=11, spaceBefore=8, spaceAfter=4)
+        body = styles["Normal"]
+
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=A4,
+            leftMargin=15 * mm,
+            rightMargin=15 * mm,
+            topMargin=15 * mm,
+            bottomMargin=15 * mm,
+            title=f"Детальный отчёт за неделю: {start_local.strftime('%d.%m')} — {end_local.strftime('%d.%m')}",
+        )
+
+        elements = []
+        elements.append(Paragraph(f"Отчёт отдела разработки", h1))
+        elements.append(Paragraph(f"{start_local.strftime('%d %B')} — {end_local.strftime('%d %B %Y')}", body))
+        elements.append(Spacer(1, 4 * mm))
+
+        # 1. Общая статистика
+        total_opened = sum(len(e["opened"]) for e in report.values())
+        total_merged = sum(len(e["merged"]) for e in report.values())
+        total_closed = sum(len(e["closed"]) for e in report.values())
+        total_reviews = sum(len(e["reviews"]) for e in report.values())
+        active_projects = len({it["repo"] for e in report.values() for it in e["opened"] + e["merged"] + e["closed"]})
+
+        elements.append(Paragraph("1. Общая статистика", h2))
+        stats_data = [["Показатель", "Значение"],
+                      ["Открыто PR", str(total_opened)],
+                      ["Объединено PR", str(total_merged)],
+                      ["Закрыто без Merge", str(total_closed)],
+                      ["Проведено ревью", str(total_reviews)],
+                      ["Активных проектов", str(active_projects)]]
+        stats_tbl = Table(stats_data, colWidths=[70 * mm, 40 * mm])
+        stats_tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#DCE6F1")]),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        elements.append(stats_tbl)
+
+        # 2. Активность сотрудников
+        elements.append(Paragraph("2. Активность сотрудников", h2))
+        emp_data = [["Сотрудник", "PR", "Ревью", "Merge", "Коммиты"]]
+        for entry in report.values():
+            emp_data.append([
+                f"{entry['tg']} / {entry['login']}",
+                str(len(entry["opened"])),
+                str(len(entry["reviews"])),
+                str(len(entry["merged"])),
+                "—",
+            ])
+        emp_tbl = Table(emp_data, repeatRows=1)
+        emp_tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("ALIGN", (1, 0), (-1, -1), "CENTER"),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#DCE6F1")]),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        elements.append(emp_tbl)
+
+        # 3. Проекты
+        elements.append(Paragraph("3. Выполненные работы по проектам", h2))
+        projects = {}
+        for entry in report.values():
+            for it in entry["merged"] + entry["opened"]:
+                proj = it["repo"].split("/")[-1] if "/" in it["repo"] else it["repo"]
+                projects.setdefault(proj, []).append((entry, it))
+        if projects:
+            for proj, items in projects.items():
+                elements.append(Paragraph(f"<b>{proj}</b>", body))
+                seen = set()
+                for entry, it in items:
+                    key = (entry["login"], it["number"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    action = "объединён" if it in entry["merged"] else "открыт"
+                    elements.append(Paragraph(f"• {entry['tg']}: PR #{it['number']} ({it['branch']}) — {action}.", body))
+                elements.append(Spacer(1, 2 * mm))
+        else:
+            elements.append(Paragraph("Нет данных.", body))
+
+        # 4. Коммиты
+        elements.append(Paragraph("4. История коммитов", h2))
+        try:
+            start_utc = start_local.astimezone(timezone.utc)
+            end_utc = end_local.astimezone(timezone.utc)
+            commits = self._collect_commits_in_period(start_utc, end_utc)
+        except Exception:
+            logger.exception("Failed to collect commits")
+            commits = []
+        if commits:
+            comm_data = [["Дата", "Сотрудник", "Коммит"]]
+            for c in sorted(commits, key=lambda x: x.get("date") or ""):
+                dt = c.get("date") or ""
+                try:
+                    dt_fmt = datetime.fromisoformat(dt.replace("Z", "+00:00")).astimezone(start_local.tzinfo).strftime("%d.%m %H:%M")
+                except Exception:
+                    dt_fmt = dt
+                comm_data.append([dt_fmt, c["author"], c["message"]])
+            comm_tbl = Table(comm_data, repeatRows=1, colWidths=[25 * mm, 35 * mm, 80 * mm])
+            comm_tbl.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#DCE6F1")]),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ]))
+            elements.append(comm_tbl)
+        else:
+            elements.append(Paragraph("Нет данных.", body))
+
+        # 5. Незавершённая работа
+        elements.append(Paragraph("5. Незавершённая работа", h2))
+        open_prs = []
+        for entry in report.values():
+            for it in entry["opened"]:
+                open_prs.append((entry, it))
+        if open_prs:
+            for entry, it in open_prs:
+                elements.append(Paragraph(f"• PR #{it['number']} — ожидает ревью / открыт, изменения не объединены ({it['repo']}).", body))
+        else:
+            elements.append(Paragraph("Нет незавершённой работы.", body))
+
+        # 6. Замечания и риски
+        elements.append(Paragraph("6. Замечания и риски", h2))
+        if open_prs:
+            for entry, it in open_prs:
+                elements.append(Paragraph(f"• PR #{it['number']} ожидает ревью.", body))
+        elements.append(Paragraph("Все данные в макете условные. В реальном отчёте записи будут содержать ссылки на Gitea.", body))
+
+        doc.build(elements)
+        return buffer.getvalue()
+
     async def _handle_weekly_report_table(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /weekly_report_table — табличный отчёт за неделю (только Denis_Arger, ЛС)."""
         user = update.effective_user
@@ -1360,6 +1667,52 @@ class TelegramWebhookBot:
             )
         except Exception:
             logger.exception("/weekly_report_table failed")
+            await update.message.reply_text("Ошибка при сборе данных. Попробуйте позже.")
+
+    async def _handle_weekly_report_detailed(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /weekly_report_detailed — детальный отчёт за неделю по макету (только Denis_Arger, ЛС)."""
+        user = update.effective_user
+        tg_username = user.username if user else None
+        if not tg_username or tg_username.lstrip("@").lower() != "denis_arger":
+            await update.message.reply_text("Команда недоступна.")
+            return
+        chat = update.effective_chat
+        if chat is not None and chat.type != "private":
+            await update.message.reply_text("Команда доступна только в личном чате.")
+            return
+        denis = next(
+            (
+                u
+                for u in self.arr_of_users
+                if (u.get("tgName") or "").lstrip("@").lower() == "denis_arger"
+            ),
+            None,
+        )
+        if not denis:
+            await update.message.reply_text("Не найден в users.json.")
+            return
+        try:
+            report, start_local, end_local = self._collect_weekly_report(
+                exclude_login=denis.get("repName")
+            )
+            text = self._build_detailed_weekly_report(report, start_local, end_local)
+            await update.message.reply_text(f"<pre>{text}</pre>", parse_mode="HTML")
+
+            from telegram import BufferedInputFile
+
+            pdf_content = self._build_detailed_weekly_report_pdf(report, start_local, end_local)
+            await update.message.reply_document(
+                document=BufferedInputFile(
+                    pdf_content,
+                    filename=(
+                        f"weekly_report_detailed_{start_local.strftime('%d%m')}"
+                        f"_{end_local.strftime('%d%m')}.pdf"
+                    ),
+                ),
+                caption="Детальный PDF-отчёт для печати",
+            )
+        except Exception:
+            logger.exception("/weekly_report_detailed failed")
             await update.message.reply_text("Ошибка при сборе данных. Попробуйте позже.")
 
     async def _handle_weekly_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1427,6 +1780,7 @@ class TelegramWebhookBot:
         app.add_handler(CommandHandler("check", self._handle_check))
         app.add_handler(CommandHandler("weekly_report", self._handle_weekly_report))
         app.add_handler(CommandHandler("weekly_report_table", self._handle_weekly_report_table))
+        app.add_handler(CommandHandler("weekly_report_detailed", self._handle_weekly_report_detailed))
         app.add_handler(CommandHandler("birthday", self._handle_birthday))
         return app
 
