@@ -30,6 +30,8 @@ from flask import Flask, jsonify, request
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
+from weekly_report_detailed import handle_weekly_report_detailed
+
 logger = logging.getLogger(__name__)
 
 
@@ -2193,147 +2195,15 @@ class TelegramWebhookBot:
 
     async def _handle_weekly_report_detailed(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /weekly_report_detailed — детальный отчёт за неделю по макету (только Denis_Arger, ЛС)."""
-        user = update.effective_user
-        tg_username = user.username if user else None
-        if not tg_username or tg_username.lstrip("@").lower() != "denis_arger":
-            await update.message.reply_text("Команда недоступна.")
-            return
-        chat = update.effective_chat
-        if chat is not None and chat.type != "private":
-            await update.message.reply_text("Команда доступна только в личном чате.")
-            return
-        denis = next(
-            (
-                u
-                for u in self.arr_of_users
-                if (u.get("tgName") or "").lstrip("@").lower() == "denis_arger"
-            ),
-            None,
+        await handle_weekly_report_detailed(
+            update,
+            context,
+            arr_of_users=self.arr_of_users,
+            collect_weekly_report=self._collect_weekly_report,
+            build_detailed_pdf=self._build_detailed_weekly_report_pdf,
+            build_detailed_text=self._build_detailed_weekly_report,
+            split_message=self._split_message,
         )
-        if not denis:
-            await update.message.reply_text("Не найден в users.json.")
-            return
-        try:
-            status_msg = await update.message.reply_text("Формирую отчёт, подождите…")
-
-            report, start_local, end_local = self._collect_weekly_report(
-                exclude_login=denis.get("repName")
-            )
-            await status_msg.edit_text("Собираю коммиты из всех веток, это может занять до 5 минут…")
-
-            # Фоновая задача: обновляем сообщение о статусе каждые 25 секунд
-            status_stop = asyncio.Event()
-
-            async def _status_loop():
-                dots = 0
-                while not status_stop.is_set():
-                    try:
-                        dots = (dots + 1) % 4
-                        await status_msg.edit_text(
-                            f"Собираю коммиты из всех веток{'.' * dots} "
-                            f"(это может занять до 5 минут)"
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        await asyncio.wait_for(status_stop.wait(), timeout=25.0)
-                    except asyncio.TimeoutError:
-                        pass
-
-            status_task = asyncio.create_task(_status_loop())
-
-            async def _build_and_send():
-                # PDF — отдельная отправка
-                import tempfile
-                import os
-                import asyncio as _asyncio
-
-                pdf_content = self._build_detailed_weekly_report_pdf(
-                    report, start_local, end_local
-                )
-                tmp = tempfile.NamedTemporaryFile(
-                    suffix=".pdf", delete=False,
-                    prefix=f"weekly_report_detailed_{start_local.strftime('%d%m')}_",
-                )
-                tmp.write(pdf_content)
-                tmp.close()
-
-                last_exc = None
-                try:
-                    for attempt in range(4):
-                        try:
-                            with open(tmp.name, "rb") as f:
-                                await context.bot.send_document(
-                                    chat_id=update.effective_chat.id,
-                                    document=f,
-                                    filename=os.path.basename(tmp.name),
-                                    caption="Детальный PDF-отчёт для печати",
-                                )
-                            break
-                        except Exception as exc:
-                            last_exc = exc
-                            logger.warning("Send PDF attempt %d failed: %s", attempt + 1, exc)
-                            if attempt < 3:
-                                await _asyncio.sleep(5 * (attempt + 1))
-                    else:
-                        raise last_exc
-                finally:
-                    try:
-                        os.unlink(tmp.name)
-                    except Exception:
-                        pass
-
-            await asyncio.wait_for(_build_and_send(), timeout=420.0)
-
-            status_stop.set()
-            try:
-                await status_task
-            except Exception:
-                pass
-
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-        except asyncio.TimeoutError:
-            logger.exception("/weekly_report_detailed timed out")
-            try:
-                if status_stop is not None:
-                    status_stop.set()
-            except Exception:
-                pass
-            try:
-                if status_task is not None:
-                    await status_task
-            except Exception:
-                pass
-            try:
-                await update.message.reply_text(
-                    "Сбор данных занимает слишком много времени. "
-                    "Отправляю частичный результат…"
-                )
-                report, start_local, end_local = self._collect_weekly_report(
-                    exclude_login=denis.get("repName")
-                )
-                text = self._build_detailed_weekly_report(report, start_local, end_local)
-                for part in self._split_message(text):
-                    await update.message.reply_text(part, parse_mode="HTML")
-            except Exception:
-                logger.exception("Failed to send partial report")
-                await update.message.reply_text("Ошибка при сборе данных. Попробуйте позже.")
-        except Exception:
-            logger.exception("/weekly_report_detailed failed")
-            try:
-                if status_stop is not None:
-                    status_stop.set()
-            except Exception:
-                pass
-            try:
-                if status_task is not None:
-                    await status_task
-            except Exception:
-                pass
-            await update.message.reply_text("Ошибка при сборе данных. Попробуйте позже.")
 
     async def _handle_weekly_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /weekly_report — отчёт за неделю, только для Denis_Arger в ЛС."""
