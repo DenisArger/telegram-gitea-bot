@@ -931,10 +931,17 @@ class TelegramWebhookBot:
 
         logger.info("/check from tg=%s -> gitea=%s", tg_username, rep_login)
         try:
+            status_msg = await update.message.reply_text("Формирую отчёт, подождите…")
+
             prs = self._collect_prs_for_reviewer(rep_login)
             logger.info("/check PRs for %s: count=%d", rep_login, len(prs))
             text = self._build_my_prs_message(prs)
             await update.message.reply_text(text, parse_mode="HTML")
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
         except Exception:
             logger.exception("/check failed for %s", rep_login)
             await update.message.reply_text("Ошибка при сборе PR. Попробуйте позже.")
@@ -1342,8 +1349,32 @@ class TelegramWebhookBot:
         doc.build(elements)
         return buffer.getvalue()
 
+    @staticmethod
+    def _ascii_table(headers: List[str], rows: List[List[str]]) -> str:
+        """Формирует ASCII-таблицу с границами."""
+        if not rows:
+            return ""
+        widths = [len(h) for h in headers]
+        for row in rows:
+            for i, cell in enumerate(row):
+                if i < len(widths):
+                    widths[i] = max(widths[i], len(str(cell)))
+
+        sep = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+        lines = [sep]
+        lines.append(
+            "|" + "|".join(f" {headers[i].ljust(widths[i])} " for i in range(len(headers))) + "|"
+        )
+        lines.append(sep)
+        for row in rows:
+            lines.append(
+                "|" + "|".join(f" {str(row[i]).ljust(widths[i])} " for i in range(len(row))) + "|"
+            )
+        lines.append(sep)
+        return "\n".join(lines)
+
     def _build_detailed_weekly_report(self, report, start_local, end_local):
-        """Детальный текстовый отчёт по макету (общая статистика, сотрудники, проекты, коммиты, незавершённая работа)."""
+        """Детальный текстовый отчёт по макету (таблицы, ссылки на Gitea)."""
         lines = []
         week_label = f"{start_local.strftime('%d %B')} — {end_local.strftime('%d %B %Y')}"
         lines.append("Отчёт отдела разработки")
@@ -1360,23 +1391,31 @@ class TelegramWebhookBot:
         active_projects = len({it["repo"] for e in report.values() for it in e["opened"] + e["merged"] + e["closed"]})
 
         lines.append("1. Общая статистика")
-        lines.append("Показатель\tЗначение")
-        lines.append(f"Открыто PR\t{total_opened}")
-        lines.append(f"Объединено PR\t{total_merged}")
-        lines.append(f"Закрыто без Merge\t{total_closed}")
-        lines.append(f"Проведено ревью\t{total_reviews}")
-        lines.append(f"Активных проектов\t{active_projects}")
+        stats_rows = [
+            ["Открыто PR", str(total_opened)],
+            ["Объединено PR", str(total_merged)],
+            ["Закрыто без Merge", str(total_closed)],
+            ["Проведено ревью", str(total_reviews)],
+            ["Активных проектов", str(active_projects)],
+        ]
+        lines.append(self._ascii_table(["Показатель", "Значение"], stats_rows))
         lines.append("")
 
         # ----- 2. Активность сотрудников -----
         lines.append("2. Активность сотрудников")
-        lines.append("Сотрудник\tPR\tРевью\tMerge\tКоммиты")
+        emp_rows = []
         for entry in report.values():
             name = f"{entry['tg']} / {entry['login']}"
-            pr_cnt = len(entry["opened"])
-            rev_cnt = len(entry["reviews"])
-            merge_cnt = len(entry["merged"])
-            lines.append(f"{name}\t{pr_cnt}\t{rev_cnt}\t{merge_cnt}\t—")
+            emp_rows.append([
+                name,
+                str(len(entry["opened"])),
+                str(len(entry["reviews"])),
+                str(len(entry["merged"])),
+                "—",
+            ])
+        lines.append(self._ascii_table(
+            ["Сотрудник", "PR", "Ревью", "Merge", "Коммиты"], emp_rows
+        ))
         lines.append("")
 
         # ----- 3. Выполненные работы по проектам -----
@@ -1396,7 +1435,10 @@ class TelegramWebhookBot:
                         continue
                     seen.add(key)
                     action = "объединён" if it in entry["merged"] else "открыт"
-                    lines.append(f"- {entry['tg']}: PR #{it['number']} ({it['branch']}) — {action}.")
+                    link = f'<a href="{it["url"]}">PR #{it["number"]}</a>'
+                    lines.append(
+                        f"- {entry['tg']}: {link} ({it['branch']}) — {action}."
+                    )
                 lines.append("")
         else:
             lines.append("Нет данных.")
@@ -1404,7 +1446,6 @@ class TelegramWebhookBot:
 
         # ----- 4. История коммитов -----
         lines.append("4. История коммитов")
-        lines.append("Дата\tСотрудник\tКоммит")
         try:
             start_utc = start_local.astimezone(timezone.utc)
             end_utc = end_local.astimezone(timezone.utc)
@@ -1413,13 +1454,15 @@ class TelegramWebhookBot:
             logger.exception("Failed to collect commits")
             commits = []
         if commits:
+            comm_rows = []
             for c in sorted(commits, key=lambda x: x.get("date") or ""):
                 dt = c.get("date") or ""
                 try:
                     dt_fmt = datetime.fromisoformat(dt.replace("Z", "+00:00")).astimezone(start_local.tzinfo).strftime("%d.%m %H:%M")
                 except Exception:
                     dt_fmt = dt
-                lines.append(f"{dt_fmt}\t{c['author']}\t{c['message']}")
+                comm_rows.append([dt_fmt, c["author"], c["message"]])
+            lines.append(self._ascii_table(["Дата", "Сотрудник", "Коммит"], comm_rows))
         else:
             lines.append("Нет данных.")
         lines.append("")
@@ -1432,7 +1475,10 @@ class TelegramWebhookBot:
                 open_prs.append((entry, it))
         if open_prs:
             for entry, it in open_prs:
-                lines.append(f"- PR #{it['number']} — ожидает ревью / открыт, изменения не объединены ({it['repo']}).")
+                link = f'<a href="{it["url"]}">PR #{it["number"]}</a>'
+                lines.append(
+                    f"- {link} — ожидает ревью / открыт, изменения не объединены ({it['repo']})."
+                )
         else:
             lines.append("Нет незавершённой работы.")
         lines.append("")
@@ -1441,7 +1487,8 @@ class TelegramWebhookBot:
         lines.append("6. Замечания и риски")
         if open_prs:
             for entry, it in open_prs:
-                lines.append(f"- PR #{it['number']} ожидает ревью.")
+                link = f'<a href="{it["url"]}">PR #{it["number"]}</a>'
+                lines.append(f"- {link} ожидает ревью.")
         lines.append("Все данные в макете условные. В реальном отчёте записи будут содержать ссылки на Gitea.")
 
         return "\n".join(lines)
@@ -1634,6 +1681,8 @@ class TelegramWebhookBot:
             await update.message.reply_text("Не найден в users.json.")
             return
         try:
+            status_msg = await update.message.reply_text("Формирую отчёт, подождите…")
+
             report, start_local, end_local = self._collect_weekly_report(
                 exclude_login=denis.get("repName")
             )
@@ -1665,6 +1714,11 @@ class TelegramWebhookBot:
                 ),
                 caption="PDF для печати",
             )
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
         except Exception:
             logger.exception("/weekly_report_table failed")
             await update.message.reply_text("Ошибка при сборе данных. Попробуйте позже.")
@@ -1692,6 +1746,8 @@ class TelegramWebhookBot:
             await update.message.reply_text("Не найден в users.json.")
             return
         try:
+            status_msg = await update.message.reply_text("Формирую отчёт, подождите…")
+
             report, start_local, end_local = self._collect_weekly_report(
                 exclude_login=denis.get("repName")
             )
@@ -1711,6 +1767,11 @@ class TelegramWebhookBot:
                 ),
                 caption="Детальный PDF-отчёт для печати",
             )
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
         except Exception:
             logger.exception("/weekly_report_detailed failed")
             await update.message.reply_text("Ошибка при сборе данных. Попробуйте позже.")
@@ -1738,11 +1799,18 @@ class TelegramWebhookBot:
             await update.message.reply_text("Не найден в users.json.")
             return
         try:
+            status_msg = await update.message.reply_text("Формирую отчёт, подождите…")
+
             report, start_local, end_local = self._collect_weekly_report(
                 exclude_login=denis.get("repName")
             )
             text = self._build_weekly_report_message(report, start_local, end_local)
             await update.message.reply_text(text, parse_mode="HTML")
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
         except Exception:
             logger.exception("/weekly_report failed")
             await update.message.reply_text("Ошибка при сборе данных. Попробуйте позже.")
