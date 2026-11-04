@@ -2,47 +2,56 @@
   {
     "repName": "LeonidParfenov",
     "tgName": "ljkiu_o",
-    "birthday": ""
+    "birthday": "",
+    "nameRu": "Парфёнов Леонид"
   },
   {
     "repName": "RomanProtchenko",
     "tgName": "nesterpetrov",
-    "birthday": ""
+    "birthday": "",
+    "nameRu": "Протченко Роман"
   },
   {
     "repName": "DenisArger",
     "tgName": "Denis_Arger",
-    "birthday": ""
+    "birthday": "",
+    "nameRu": "Аргер Денис"
   },
   {
     "repName": "VeronikaRitareva",
     "tgName": "vritareva",
-    "birthday": ""
+    "birthday": "",
+    "nameRu": "Ритарева Вероника"
   },
   {
     "repName": "NikitaHalukh",
     "tgName": "gn370p0",
-    "birthday": "22-10"
+    "birthday": "22-10",
+    "nameRu": "Галух Никита"
   },
   {
     "repName": "AleksandrOvsyanikov",
     "tgName": "iressq",
     "birthday": "",
-    "wish": "Пусть в этом году всё merge'ится без конфликтов!"
+    "wish": "Пусть в этом году всё merge'ится без конфликтов!",
+    "nameRu": "Овсяников Александр"
   },
   {
     "repName": "DaniilKrauchanka",
     "tgName": "Krava_DpS",
-    "birthday": ""
+    "birthday": "",
+    "nameRu": "Даниил Кравченко"
   },
   {
     "repName": "AntonKharlan",
     "tgName": "ankharlan",
-    "birthday": ""
+    "birthday": "",
+    "nameRu": "Антон Харлан"
   },
   {
     "repName": "ArtemMiroshnichenko",
     "tgName": "Blarky",
-    "birthday": ""
+    "birthday": "",
+    "nameRu": "Артем Мирошниченко"
   }
 ]

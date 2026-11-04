@@ -21,6 +21,7 @@ import logging
 import os
 import random
 import re
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
@@ -29,7 +30,7 @@ import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ContextTypes
+from telegram.ext import ContextTypes, CommandHandler
 
 from weekly_report_detailed import handle_weekly_report_detailed
 
@@ -111,6 +112,77 @@ class TelegramWebhookBot:
         self.app.route("/set-webhook", methods=["GET"])(self.set_telegram_webhook)
         self.app.route("/get-webhook-info", methods=["GET"])(self.get_telegram_webhook_info)
         self.app.route("/prs-to-review", methods=["GET"])(self.prs_to_review)
+
+        # Персистентный кэш ответов Gitea (файл в той же директории).
+        # Ключ: (method, path, params) -> (timestamp, data).
+        # TTL по умолчанию — 600 с (10 мин), настраивается через GITEA_CACHE_TTL.
+        self._gitea_cache: Dict[str, tuple] = {}
+        try:
+            self._gitea_cache_ttl = float(os.getenv("GITEA_CACHE_TTL", "600"))
+        except (TypeError, ValueError):
+            self._gitea_cache_ttl = 600.0
+        self._gitea_cache_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), ".gitea_cache.json"
+        )
+        self._load_gitea_cache()
+
+        # Список исключаемых репозиториев (owner/repo) для сбора коммитов.
+        # Настройка через GITEA_REPOSITORIES_EXCLUDE, например:
+        #   GITEA_REPOSITORIES_EXCLUDE=KristapsTunnis/webmonprm,DenisArger/StandsTest
+        exclude_raw = os.getenv("GITEA_REPOSITORIES_EXCLUDE", "")
+        excluded = {r.strip() for r in exclude_raw.split(",") if r.strip()}
+        # По умолчанию исключаем громоздкие/ненужные репозитории,
+        # чтобы сбор коммитов не тормозил на них.
+        excluded.update({
+            "KristapsTunnis/webmonprm",
+            "KristapsTunnis/test_rep",
+        })
+        self._gitea_repositories_exclude = excluded
+
+    def _load_gitea_cache(self) -> None:
+        """Загружает кэш из файла, отбрасывая устаревшие записи."""
+        try:
+            if not os.path.exists(self._gitea_cache_path):
+                return
+            with open(self._gitea_cache_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            now = time.time()
+            loaded = 0
+            for k, v in raw.items():
+                if not isinstance(v, list) or len(v) != 2:
+                    continue
+                ts, data = v
+                if not isinstance(ts, (int, float)):
+                    continue
+                if now - ts < self._gitea_cache_ttl:
+                    self._gitea_cache[k] = (float(ts), data)
+                    loaded += 1
+            logger.debug("Gitea cache loaded %d entries from %s", loaded, self._gitea_cache_path)
+        except Exception:
+            # Повреждённый/неполный файл кэша — удаляем и начинаем с чистого кэша
+            logger.warning("Gitea cache file corrupted, resetting")
+            try:
+                if os.path.exists(self._gitea_cache_path):
+                    os.remove(self._gitea_cache_path)
+            except Exception:
+                pass
+            self._gitea_cache = {}
+
+    def _save_gitea_cache(self) -> None:
+        """Сохраняет кэш в файл (best-effort)."""
+        try:
+            now = time.time()
+            snapshot = {
+                k: [ts, data]
+                for k, (ts, data) in self._gitea_cache.items()
+                if now - ts < self._gitea_cache_ttl
+            }
+            tmp_path = self._gitea_cache_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False)
+            os.replace(tmp_path, self._gitea_cache_path)
+        except Exception:
+            logger.debug("Failed to save Gitea cache", exc_info=True)
 
     def load_users(self) -> List[Dict]:
         """Load users from users.json"""
@@ -325,6 +397,75 @@ class TelegramWebhookBot:
     # ------------------------------------------------------------------ #
     # Gitea API client (stateless — метки хранятся в комментариях PR)
     # ------------------------------------------------------------------ #
+    def _compact_gitea_response(self, path: str, data):
+        """Усекает ответ Gitea до минимума, нужного для сбора коммитов.
+
+        Полные ответы API (включая stats по файлам, комментарии и т.д.)
+        могут весить десятки МБ — это непрактично для кэша.
+        """
+        if not isinstance(data, list):
+            return data
+        # Запросы по веткам и коммитам — усекаем до нужных полей
+        if "/branches" in path:
+            return [
+                {"name": b.get("name")}
+                for b in data
+                if isinstance(b, dict)
+            ]
+        if "/commits" in path:
+            compact = []
+            for c in data:
+                if not isinstance(c, dict):
+                    continue
+                commit = c.get("commit") or {}
+                commit_author = commit.get("author") or {}
+                compact.append({
+                    "sha": c.get("sha"),
+                    "author": {
+                        "login": (c.get("author") or {}).get("login"),
+                        "name": commit_author.get("name"),
+                    },
+                    "commit": {
+                        "author": {
+                            "name": commit_author.get("name"),
+                            "date": commit_author.get("date"),
+                        },
+                        "committer": {
+                            "date": (commit.get("committer") or {}).get("date"),
+                        },
+                        "message": commit.get("message"),
+                    },
+                })
+            return compact
+        return data
+
+    def _gitea_request_cached(self, method: str, path: str, **kwargs) -> Optional[Dict]:
+        """Gitea API request with in-memory TTL cache.
+
+        Кэширует успешные ответы на `self._gitea_cache_ttl` секунд,
+        чтобы при сборе коммитов по всем веткам не дублировать одни и те же
+        запросы (например, `/branches` для одного репозитория).
+        """
+        cache_key = f"{method}:{path}:{repr(sorted(kwargs.get('params', {}).items()))}"
+        now = time.time()
+        cached = self._gitea_cache.get(cache_key)
+        if cached is not None:
+            ts, data = cached
+            if now - ts < self._gitea_cache_ttl:
+                return data
+        data = self._gitea_request(method, path, **kwargs)
+        if data is not None:
+            compacted = self._compact_gitea_response(path, data)
+            self._gitea_cache[cache_key] = (now, compacted)
+            # Очистка редко растущего кэша
+            if len(self._gitea_cache) > 500:
+                oldest = sorted(self._gitea_cache.items(), key=lambda kv: kv[1][0])[:250]
+                for k, _ in oldest:
+                    self._gitea_cache.pop(k, None)
+            # Персистентность: сохраняем в файл best-effort
+            self._save_gitea_cache()
+        return data
+
     def _gitea_request(self, method: str, path: str, **kwargs) -> Optional[Dict]:
         if not self.gitea_url or not self.gitea_token:
             logger.warning("Gitea API not configured (GITEA_URL/GITEA_TOKEN)")
@@ -332,7 +473,7 @@ class TelegramWebhookBot:
         url = f"{self.gitea_url}/api/v1{path}"
         headers = {"Authorization": f"token {self.gitea_token}"}
         try:
-            resp = requests.request(method, url, headers=headers, timeout=15, **kwargs)
+            resp = requests.request(method, url, headers=headers, timeout=30, **kwargs)
             if resp.status_code in (200, 201):
                 return resp.json()
             if resp.status_code == 404:
@@ -341,6 +482,10 @@ class TelegramWebhookBot:
                 return None
             logger.error("Gitea API %s %s -> %s %s", method, path,
                          resp.status_code, resp.text[:200])
+            return None
+        except requests.exceptions.ReadTimeout:
+            # Gitea не ответил вовремя — не паникуем, возвращаем None
+            logger.debug("Gitea API timeout: %s %s", method, path)
             return None
         except Exception:
             logger.exception("Gitea API request failed: %s %s", method, path)
@@ -559,25 +704,36 @@ class TelegramWebhookBot:
     def _normalized_repositories(self) -> List[str]:
         """Возвращает список 'owner/repo' или вызывает `_gitea_list_all_repos`
         при `ALL`. Очищает значения от мусора (например, `GITEA_REPOSITORIES=ALL`
-        из сломанного .env)."""
+        из сломанного .env).
+
+        Исключает репозитории, указанные в `GITEA_REPOSITORIES_EXCLUDE`
+        (owner/repo через запятую), чтобы не тратить время на медленные/ненужные
+        репозитории при сборе коммитов.
+        """
+        exclude = getattr(self, "_gitea_repositories_exclude", set())
         repos = self.gitea_repositories
         if not repos:
-            return self._gitea_list_all_repos()
-
-        # Нормализуем: убираем возможные `KEY=VALUE` и пустые элементы
-        cleaned = []
-        for r in repos:
-            r = (r or "").strip()
-            if not r:
-                continue
-            if "=" in r:
-                r = r.split("=", 1)[-1].strip()
-            if not r:
-                continue
-            if r.upper() == "ALL":
-                return self._gitea_list_all_repos()
-            cleaned.append(r)
-        return cleaned
+            result = self._gitea_list_all_repos()
+        else:
+            # Нормализуем: убираем возможные `KEY=VALUE` и пустые элементы
+            cleaned = []
+            for r in repos:
+                r = (r or "").strip()
+                if not r:
+                    continue
+                if "=" in r:
+                    r = r.split("=", 1)[-1].strip()
+                if not r:
+                    continue
+                if r.upper() == "ALL":
+                    result = self._gitea_list_all_repos()
+                    break
+                cleaned.append(r)
+            else:
+                result = cleaned
+        if exclude:
+            result = [r for r in result if r not in exclude]
+        return result
 
     # ------------------------------------------------------------------ #
     # Delivery — единственный путь отправки, единый шаблон клавиатуры
@@ -2255,8 +2411,6 @@ class TelegramWebhookBot:
             arr_of_users=self.arr_of_users,
             collect_weekly_report=self._collect_weekly_report,
             build_detailed_pdf=self._build_detailed_weekly_report_pdf,
-            build_detailed_text=self._build_detailed_weekly_report,
-            split_message=self._split_message,
         )
 
     async def _handle_weekly_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2332,6 +2486,7 @@ class TelegramWebhookBot:
         app.add_handler(CommandHandler("weekly_report", self._handle_weekly_report))
         app.add_handler(CommandHandler("weekly_report_table", self._handle_weekly_report_table))
         app.add_handler(CommandHandler("weekly_report_detailed", self._handle_weekly_report_detailed))
+        app.add_handler(CommandHandler("week", self._handle_week_commits))
         app.add_handler(CommandHandler("birthday", self._handle_birthday))
         return app
 
@@ -2846,10 +3001,249 @@ class TelegramWebhookBot:
         for canonical, aliases in mapping.items():
             if rt in aliases:
                 return canonical
+
+
         return rt
 
 
 # Запуск бота (локально)
+
+    def _collect_commits_all_authors_week(self):
+        """Собирает коммиты ВСЕХ авторов за неделю по ВСЕМ веткам репозиториев.
+
+        В отличие от предыдущей версии (фильтровавшей одного автора и смотревшей
+        только в дефолтную ветку), этот метод:
+        - не фильтрует по автору;
+        - перебирает все ветки каждого репозитория через /branches/{branch}/commits.
+        """
+        start_local, end_local = self._week_bounds()
+        start_utc = start_local.astimezone(timezone.utc)
+        end_utc = end_local.astimezone(timezone.utc)
+        commits = []
+        repos = self._normalized_repositories()
+        from dateutil import parser as dateparser
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time as _time
+        _start_time = _time.monotonic()
+        # Общий лимит на всю операцию — настраивается через GITEA_WEEK_TIMEOUT
+        try:
+            _TIME_LIMIT = float(os.getenv("GITEA_WEEK_TIMEOUT", "240"))
+        except (TypeError, ValueError):
+            _TIME_LIMIT = 240.0
+
+        def _list_branches(owner, repo):
+            branches = []
+            page = 1
+            while True:
+                if _time.monotonic() - _start_time > _TIME_LIMIT:
+                    break
+                try:
+                    data = self._gitea_request_cached(
+                        "GET",
+                        f"/repos/{owner}/{repo}/branches",
+                        params={"page": page, "limit": 50},
+                    )
+                except Exception:
+                    logger.exception("Failed to list branches for %s/%s", owner, repo)
+                    break
+                if not data:
+                    break
+                for b in data:
+                    name = self._clean_branch_name(b.get("name"))
+                    if name:
+                        branches.append(name)
+                if len(data) < 50:
+                    break
+                page += 1
+            return branches
+
+        # Собираем все задачи (репозиторий, ветка) для параллельной обработки
+        branch_jobs = []
+        for repo_info in repos:
+            if _time.monotonic() - _start_time > _TIME_LIMIT:
+                break
+            parsed = self._extract_owner_repo(repo_info)
+            if not parsed:
+                continue
+            owner, repo = parsed
+            branches = _list_branches(owner, repo)
+            if not branches:
+                branches = [None]
+            for branch in branches:
+                branch_jobs.append((repo_info, owner, repo, branch))
+
+        def fetch_branch_commits(job):
+            repo_info, owner, repo, branch = job
+            if _time.monotonic() - _start_time > _TIME_LIMIT:
+                return []
+            repo_commits = []
+            page = 1
+            while True:
+                if _time.monotonic() - _start_time > _TIME_LIMIT:
+                    break
+                try:
+                    params = {"page": page, "limit": 50}
+                    if branch:
+                        params["sha"] = branch
+                    data = self._gitea_request_cached(
+                        "GET",
+                        f"/repos/{owner}/{repo}/commits",
+                        params=params,
+                    )
+                except Exception:
+                    logger.exception("Failed to list commits for %s/%s branch=%s", owner, repo, branch)
+                    break
+                if not data:
+                    break
+                for c in data:
+                    commit = c.get("commit") or {}
+                    commit_author = commit.get("author") or {}
+                    committer = commit.get("committer") or {}
+                    date_str = commit_author.get("date") or committer.get("date")
+                    if not date_str:
+                        continue
+                    try:
+                        dt = dateparser.isoparse(date_str)
+                    except Exception:
+                        continue
+                    if not (start_utc <= dt <= end_utc):
+                        continue
+                    author_login = (c.get("author") or {}).get("login") or ""
+                    commit_name = commit_author.get("name") or ""
+                    sha = c.get("sha", "")
+                    repo_commits.append({
+                        'repo': repo,
+                        'repo_full': repo_info,
+                        'branch': branch or '?',
+                        'author_login': author_login,
+                        'author_name': commit_name,
+                        'hash': sha[:7],
+                        'msg': (commit.get("message") or "").split("\n")[0],
+                        'time': dt.astimezone(start_local.tzinfo).strftime("%H:%M"),
+                        'date_iso': date_str,
+                        'datetime': dt
+                    })
+                if len(data) < 50:
+                    break
+                page += 1
+            return repo_commits
+
+        # Параллельная обработка задач по веткам
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            future_to_job = {executor.submit(fetch_branch_commits, j): j for j in branch_jobs}
+            deadline = _start_time + _TIME_LIMIT
+            timed_out = False
+            try:
+                for future in as_completed(future_to_job, timeout=max(0.1, deadline - _time.monotonic())):
+                    job = future_to_job[future]
+                    try:
+                        commits.extend(future.result())
+                    except Exception:
+                        logger.exception("fetch_branch_commits failed for %s/%s branch=%s", job[1], job[2], job[3])
+            except Exception:
+                timed_out = True
+                logger.warning("Commit collection timed out after %ss, returning partial results", _TIME_LIMIT)
+            finally:
+                executor.shutdown(wait=False)
+        if timed_out:
+            logger.warning("Collected %d commits from %d repos before timeout", len(commits), len(repos))
+        return commits, start_local, end_local
+
+    def _build_week_commits_text_all(self, commits, start_local, end_local):
+        """Форматирует отчёт по коммитам всех авторов за неделю.
+
+        Группировка: день → автор → репозиторий/ветка → коммиты.
+        """
+        if not commits:
+            return f"Отчёт за {start_local.strftime('%d.%m.%Y')} – {end_local.strftime('%d.%m.%Y')} (пн–вс)\n\nКоммитов не найдено."
+        try:
+            commits_sorted = sorted(commits, key=lambda x: x['datetime'] if x['datetime'] else x['date_iso'])
+        except Exception:
+            commits_sorted = commits
+        from collections import defaultdict
+        days_ru = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
+        lines = []
+        lines.append(f"Отчёт за {start_local.strftime('%d.%m.%Y')} – {end_local.strftime('%d.%m.%Y')} (пн–вс)")
+        lines.append("")
+
+        def _date_key(c):
+            try:
+                if c['datetime']:
+                    return c['datetime'].strftime('%Y-%m-%d')
+                return c['date_iso'][:10]
+            except Exception:
+                return c.get('date_iso', 'unknown')[:10]
+
+        for date_key in sorted(set(_date_key(c) for c in commits_sorted)):
+            try:
+                dt_date = datetime.strptime(date_key, '%Y-%m-%d')
+                day_name = days_ru[dt_date.weekday()]
+                lines.append(f"{day_name}, {dt_date.strftime('%d.%m.%Y')}")
+            except Exception:
+                lines.append(date_key)
+            day_commits = [c for c in commits_sorted if _date_key(c) == date_key]
+            by_author = defaultdict(list)
+            for c in day_commits:
+                key = c.get('author_login') or c.get('author_name') or 'Unknown'
+                by_author[key].append(c)
+            for author in sorted(by_author.keys()):
+                author_commits = by_author[author]
+                author_label = author_commits[0].get('author_name') or author
+                lines.append(f"├─ {author_label} ({author})")
+                groups = defaultdict(list)
+                for it in author_commits:
+                    key_g = f"{it['repo']}|{it['branch']}"
+                    groups[key_g].append(it)
+                for gkey in sorted(groups.keys()):
+                    repo_name, branch = gkey.split('|', 1)
+                    lines.append(f"│  ├─ {repo_name} | ветка: {branch}")
+                    for it in sorted(groups[gkey], key=lambda x: x['time']):
+                        lines.append(f"│  │  {it['time']} {it['hash']} {it['msg']}")
+                lines.append("│")
+            lines.append("")
+        repos_set = set(c['repo'] for c in commits_sorted)
+        branches_set = set(c['branch'] for c in commits_sorted)
+        authors_set = set(c.get('author_login') or c.get('author_name') or '?' for c in commits_sorted)
+        lines.append(
+            f"Итого: {len(commits_sorted)} коммитов | "
+            f"{len(authors_set)} авторов | "
+            f"{len(repos_set)} репозиториев | "
+            f"{len(branches_set)} веток"
+        )
+        return '\n'.join(lines)
+
+    async def _handle_week_commits(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.effective_message
+        user = update.effective_user
+        chat = update.effective_chat
+        if message is None or user is None or chat is None:
+            return
+        if chat.type != 'private':
+            await message.reply_text('Команда доступна только в личном чате.')
+            return
+        tg_username = (user.username or '').lstrip('@').lower()
+        if tg_username != 'denis_arger':
+            await message.reply_text('Команда недоступна.')
+            return
+        denis = next((item for item in self.arr_of_users if (item.get('tgName') or '').lstrip('@').lower() == 'denis_arger'), None)
+        if denis is None:
+            await message.reply_text('Не найден в users.json.')
+            return
+        try:
+            await message.reply_text('Собираю коммиты за неделю...')
+            commits, start_local, end_local = await asyncio.get_event_loop().run_in_executor(None, self._collect_commits_all_authors_week)
+            text = self._build_week_commits_text_all(commits, start_local, end_local)
+            if len(text) > 4096:
+                for i in range(0, len(text), 4096):
+                    await message.reply_text(text[i:i+4096])
+            else:
+                await message.reply_text(text)
+        except Exception as e:
+            logger.exception('/week failed')
+            await message.reply_text(f'Ошибка: {e}')
+
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     bot = TelegramWebhookBot()

@@ -18,7 +18,7 @@ import logging
 import os
 import tempfile
 import time
-from typing import Callable, List, Optional
+from typing import Callable, Optional
 
 from telegram import Update
 from telegram.error import NetworkError, RetryAfter, TimedOut
@@ -28,14 +28,13 @@ logger = logging.getLogger(__name__)
 
 CollectWeeklyReport = Callable[..., tuple]
 BuildDetailedPDF = Callable[..., bytes]
-BuildDetailedText = Callable[..., str]
-SplitMessage = Callable[[str], List[str]]
 
 STATUS_UPDATE_INTERVAL = 5.0
 REPORT_TIMEOUT_SECONDS = 420.0
 PDF_BUILD_TIMEOUT_SECONDS = 120.0
 SEND_ATTEMPTS = 4
 SEND_RETRY_DELAY_SECONDS = 5.0
+_ACTIVE_REPORT_CHATS = set()
 
 
 async def _send_document_with_retry(
@@ -170,8 +169,6 @@ async def handle_weekly_report_detailed(
     arr_of_users: list,
     collect_weekly_report: CollectWeeklyReport,
     build_detailed_pdf: BuildDetailedPDF,
-    build_detailed_text: BuildDetailedText,
-    split_message: SplitMessage,
 ) -> None:
     """
     Команда /weekly_report_detailed — детальный отчёт за неделю
@@ -207,13 +204,37 @@ async def handle_weekly_report_detailed(
         await message.reply_text("Не найден в users.json.")
         return
 
+    if chat.id in _ACTIVE_REPORT_CHATS:
+        await message.reply_text(
+            "Предыдущий отчёт ещё формируется в фоне. "
+            "Повторите команду, когда завершится текущая сборка."
+        )
+        return
+
+    _ACTIVE_REPORT_CHATS.add(chat.id)
+
     status_msg = None
     status_stop = asyncio.Event()
     status_task = None
     report = None
     start_local = None
     end_local = None
+    background_future = None
+    keep_chat_busy_until_future_finishes = False
     operation_started_at = time.monotonic()
+
+    def keep_chat_busy_until_done(future) -> None:
+        nonlocal keep_chat_busy_until_future_finishes
+        keep_chat_busy_until_future_finishes = True
+
+        def release_chat(_future) -> None:
+            try:
+                _future.exception()
+            except (asyncio.CancelledError, Exception):
+                pass
+            _ACTIVE_REPORT_CHATS.discard(chat.id)
+
+        future.add_done_callback(release_chat)
 
     try:
         status_msg = await message.reply_text("Формирую отчёт, подождите…")
@@ -221,18 +242,20 @@ async def handle_weekly_report_detailed(
         # Сбор данных выполняется ровно один раз.
         collect_started_at = time.monotonic()
         loop = asyncio.get_running_loop()
+        background_future = loop.run_in_executor(
+            None,
+            partial(
+                collect_weekly_report,
+                exclude_login=denis.get("repName"),
+            ),
+        )
         try:
             report, start_local, end_local = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None,
-                    partial(
-                        collect_weekly_report,
-                        exclude_login=denis.get("repName"),
-                    ),
-                ),
+                asyncio.shield(background_future),
                 timeout=REPORT_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
+            keep_chat_busy_until_done(background_future)
             logger.exception("Weekly report data collection timed out")
             await message.reply_text(
                 "Сбор данных превысил допустимое время. "
@@ -263,14 +286,15 @@ async def handle_weekly_report_detailed(
 
         # Синхронную генерацию PDF переносим в executor, чтобы не блокировать event loop.
         pdf_started_at = time.monotonic()
+        background_future = loop.run_in_executor(
+            None,
+            build_detailed_pdf,
+            report,
+            start_local,
+            end_local,
+        )
         pdf_content = await asyncio.wait_for(
-            loop.run_in_executor(
-                None,
-                build_detailed_pdf,
-                report,
-                start_local,
-                end_local,
-            ),
+            asyncio.shield(background_future),
             timeout=PDF_BUILD_TIMEOUT_SECONDS,
         )
 
@@ -310,28 +334,14 @@ async def handle_weekly_report_detailed(
         await message.reply_text("Детальный PDF-отчёт сформирован и отправлен.")
 
     except asyncio.TimeoutError:
+        if background_future is not None and not background_future.done():
+            keep_chat_busy_until_done(background_future)
         logger.exception("PDF generation timed out")
         await message.reply_text(
             "Формирование PDF превысило допустимое время. "
-            "Данные уже собраны, но PDF не удалось подготовить."
+            "Данные собраны, но генерация ещё продолжается в фоне. "
+            "После её завершения можно будет запустить отчёт снова."
         )
-
-        # Если данные уже собраны, пробуем отправить текстовую версию
-        # из тех же данных, не обращаясь повторно к Gitea.
-        if report is not None:
-            try:
-                text_report = build_detailed_text(
-                    report,
-                    start_local,
-                    end_local,
-                )
-                for part in split_message(text_report):
-                    await message.reply_text(part, parse_mode="HTML")
-            except Exception:
-                logger.exception("Failed to build/send text fallback report")
-                await message.reply_text(
-                    "Не удалось сформировать текстовую версию отчёта."
-                )
 
     except Exception as exc:
         logger.exception("/weekly_report_detailed failed")
@@ -341,6 +351,9 @@ async def handle_weekly_report_detailed(
         )
 
     finally:
+        if not keep_chat_busy_until_future_finishes:
+            _ACTIVE_REPORT_CHATS.discard(chat.id)
+
         await _stop_status_task(
             stop_event=status_stop,
             status_task=status_task,
