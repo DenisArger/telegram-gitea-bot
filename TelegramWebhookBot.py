@@ -2926,6 +2926,37 @@ class TelegramWebhookBot:
             return
         await self.deliver(Notification(text=text, rep_link=rep_link))
 
+    _REVIEW_APPROVED_MESSAGES = [
+        "✅ Зелёный свет: PR принят",
+        "🚀 Апрув получен — можно лететь",
+        "✅ Ревью пройдено: замечаний нет",
+        "🎯 Одобрено. Путь к merge открыт",
+        "✅ Апрув — код прошёл проверку",
+        "🟢 Апрув! PR готов к следующему шагу",
+        "✨ Одобрено без правок",
+        "🏁 Ревьюер поставил «за»",
+    ]
+    _REVIEW_REJECTED_MESSAGES = [
+        "🛠 Запрошены правки перед merge",
+        "🔧 Ревьюер просит доработать PR",
+        "❌ Пока не апрув: нужны изменения",
+        "🧩 Найдены моменты на доработку",
+        "🚧 Стоп перед merge — есть замечания",
+        "🔍 Ревью завершено: ждём правки",
+        "📋 Запрошены изменения по результатам ревью",
+        "⚠️ Нужна итерация: ревьюер оставил замечания",
+    ]
+    _REVIEW_COMMENTED_MESSAGES = [
+        "💬 В PR появился новый комментарий",
+        "🗨 Ревьюер оставил заметку к PR",
+        "💬 Есть вопрос/комментарий по PR",
+        "📌 Новый комментарий — загляните в обсуждение",
+        "🧠 Появилась мысль по коду: новый комментарий",
+        "💬 Обсуждение продолжается — есть новый комментарий",
+        "🔎 К PR оставлен комментарий, требуется взгляд",
+        "💬 Новая реплика в ревью",
+    ]
+
     async def handle_reviewed_event(self, action, data, main_user, repo_name, branch, rep_link):
         """Обработка отзыва."""
         review = data.get("review", {}) or {}
@@ -2950,15 +2981,15 @@ class TelegramWebhookBot:
             return self._pr_thread_mentions(data, exclude=comment_author)
 
         if review_type == "pull_request_review_approved":
-            text = self._build("✅ одобрен", data, repo, url, [author_mention])
+            text = self._build(random.choice(self._REVIEW_APPROVED_MESSAGES), data, repo, url, [author_mention])
         elif review_type == "pull_request_review_commented":
             mentions = build_comment_mentions()
-            text = self._build("💬 оставлен комментарий", data, repo, url, mentions)
+            text = self._build(random.choice(self._REVIEW_COMMENTED_MESSAGES), data, repo, url, mentions)
         elif review_type == "pull_request_review_rejected":
-            text = self._build("❌ отклонён", data, repo, url, [author_mention])
+            text = self._build(random.choice(self._REVIEW_REJECTED_MESSAGES), data, repo, url, [author_mention])
         elif review_type == "pull_request_comment":
             mentions = build_comment_mentions()
-            text = self._build("💬 оставлен комментарий", data, repo, url, mentions)
+            text = self._build(random.choice(self._REVIEW_COMMENTED_MESSAGES), data, repo, url, mentions)
         elif review_type == "pull_request_review_comment":
             throttle_key = f"{comment_author}:{self._pr_number(data)}"
             # Only notify PR author, not reviewers
@@ -3233,6 +3264,26 @@ class TelegramWebhookBot:
             await message.reply_text('Собираю коммиты за неделю...')
             commits, start_local, end_local = await asyncio.get_event_loop().run_in_executor(None, self._collect_commits_all_authors_week)
             text = self._build_week_commits_text_all(commits, start_local, end_local)
+
+            # Компактный блок PR-активности (из weekly report)
+            try:
+                report, _, _ = await asyncio.get_event_loop().run_in_executor(None, self._collect_weekly_report)
+                pr_lines = ["", "PR за неделю:"]
+                for login, data in report.items():
+                    author = data.get("tg") or login
+                    o = len(data.get("opened", []))
+                    r = len(data.get("reviews", []))
+                    m = len(data.get("merged", []))
+                    c = len(data.get("closed", []))
+                    if o or r or m or c:
+                        pr_lines.append(f"• {author}: открыто {o}, ревью {r}, слито {m}, закрыто {c}")
+                        for pr in data.get("opened", []) + data.get("merged", []) + data.get("closed", []):
+                            pr_lines.append(f"   #{pr.get('number')} {pr.get('repo')} {pr.get('branch')}")
+                if len(pr_lines) > 2:
+                    text += "\n" + "\n".join(pr_lines)
+            except Exception:
+                logger.exception("Failed to append PR activity to /week")
+
             if len(text) > 4096:
                 for i in range(0, len(text), 4096):
                     await message.reply_text(text[i:i+4096])
