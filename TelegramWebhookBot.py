@@ -1140,11 +1140,13 @@ class TelegramWebhookBot:
     # ------------------------------------------------------------------ #
     # Telegram command: /weekly_report (только ЛС, только Denis_Arger)
     # ------------------------------------------------------------------ #
-    def _week_bounds(self):
+    def _week_bounds(self, weeks_ago: int = 0):
+        """Пн–вс для недели. weeks_ago=0 — текущая, 1 — прошлая."""
         now_local = datetime.now().astimezone()
-        monday = (now_local - timedelta(days=now_local.weekday())).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        monday = (
+            now_local
+            - timedelta(days=now_local.weekday() + weeks_ago * 7)
+        ).replace(hour=0, minute=0, second=0, microsecond=0)
         sunday = (monday + timedelta(days=6)).replace(
             hour=23, minute=59, second=59
         )
@@ -3039,7 +3041,7 @@ class TelegramWebhookBot:
 
 # Запуск бота (локально)
 
-    def _collect_commits_all_authors_week(self):
+    def _collect_commits_all_authors_week(self, weeks_ago: int = 0):
         """Собирает коммиты ВСЕХ авторов за неделю по ВСЕМ веткам репозиториев.
 
         В отличие от предыдущей версии (фильтровавшей одного автора и смотревшей
@@ -3047,7 +3049,7 @@ class TelegramWebhookBot:
         - не фильтрует по автору;
         - перебирает все ветки каждого репозитория через /branches/{branch}/commits.
         """
-        start_local, end_local = self._week_bounds()
+        start_local, end_local = self._week_bounds(weeks_ago)
         start_utc = start_local.astimezone(timezone.utc)
         end_utc = end_local.astimezone(timezone.utc)
         commits = []
@@ -3260,9 +3262,15 @@ class TelegramWebhookBot:
         if denis is None:
             await message.reply_text('Не найден в users.json.')
             return
+
+        args = context.args or []
+        weeks_ago = 1 if any(a.lower() in ('last', 'prev', 'previous') for a in args) else 0
+
         try:
             await message.reply_text('Собираю коммиты за неделю...')
-            commits, start_local, end_local = await asyncio.get_event_loop().run_in_executor(None, self._collect_commits_all_authors_week)
+            commits, start_local, end_local = await asyncio.get_event_loop().run_in_executor(
+                None, self._collect_commits_all_authors_week, weeks_ago
+            )
             text = self._build_week_commits_text_all(commits, start_local, end_local)
 
             # Компактный блок PR-активности (из weekly report)
