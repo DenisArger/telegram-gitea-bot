@@ -2489,6 +2489,7 @@ class TelegramWebhookBot:
         app.add_handler(CommandHandler("weekly_report_table", self._handle_weekly_report_table))
         app.add_handler(CommandHandler("weekly_report_detailed", self._handle_weekly_report_detailed))
         app.add_handler(CommandHandler("week", self._handle_week_commits))
+        app.add_handler(CommandHandler("summary", self._handle_week_summary))
         app.add_handler(CommandHandler("birthday", self._handle_birthday))
         return app
 
@@ -3301,6 +3302,188 @@ class TelegramWebhookBot:
             logger.exception('/week failed')
             await message.reply_text(f'Ошибка: {e}')
 
+    # ------------------------------------------------------------------ #
+    # Telegram command: /summary (саммари по сотрудникам за неделю)
+    # ------------------------------------------------------------------ #
+    def _build_author_summaries(self, commits, report, start_local, end_local):
+        """Саммари по каждому сотруднику: чем занимался за неделю.
+
+        Группировка: по сотруднику (repName) -> коммиты + PR-активность.
+        """
+        from collections import defaultdict
+
+        days_ru = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
+        stop_words = {
+            'и', 'в', 'на', 'с', 'по', 'для', 'из', 'от', 'до', 'а', 'но', 'или',
+            'the', 'a', 'an', 'to', 'of', 'for', 'in', 'on', 'and', 'or',
+            'fix', 'feat', 'bug', 'refactor', 'docs', 'style', 'test', 'chore',
+            'update', 'add', 'remove', 'merge', 'branch', 'commit',
+        }
+        prefixes = ('feat', 'fix', 'refactor', 'docs', 'style', 'test',
+                    'chore', 'perf', 'build', 'ci')
+
+        commits_by_login = defaultdict(list)
+        rep_logins = {
+            u.get("repName") for u in self.arr_of_users if u.get("repName")
+        }
+        for c in commits:
+            # Коммиты из _collect_commits_all_authors_week несут author_login
+            # (Gitea login) и author_name, но не author/author_email.
+            author_login = (c.get("author_login") or "").strip()
+            login = None
+            if author_login and author_login in rep_logins:
+                login = author_login
+            else:
+                probe = {
+                    "author": c.get("author_name") or "",
+                    "author_email": c.get("author_email") or "",
+                }
+                login = self._match_commit_author_to_user(probe)
+            if login:
+                commits_by_login[login].append(c)
+
+        lines = []
+        lines.append(
+            f"📋 Саммари за {start_local.strftime('%d.%m.%Y')} – "
+            f"{end_local.strftime('%d.%m.%Y')} (пн–вс)"
+        )
+        lines.append("")
+
+        for u in self.arr_of_users:
+            login = u.get("repName")
+            tg = u.get("tgName") or ""
+            if not login:
+                continue
+            user_commits = commits_by_login.get(login, [])
+            pr_data = report.get(login, {})
+
+            o = len(pr_data.get("opened", []))
+            r = len(pr_data.get("reviews", []))
+            m = len(pr_data.get("merged", []))
+            c = len(pr_data.get("closed", []))
+            total_pr = o + r + m + c
+
+            if not user_commits and total_pr == 0:
+                continue
+
+            repos = sorted({cm.get("repo") or "?" for cm in user_commits})
+            branches = sorted({cm.get("branch") or "?" for cm in user_commits})
+
+            active_days = set()
+            for cm in user_commits:
+                try:
+                    if cm.get("datetime"):
+                        active_days.add(cm["datetime"].strftime("%Y-%m-%d"))
+                    elif cm.get("date_iso"):
+                        active_days.add(cm["date_iso"][:10])
+                except Exception:
+                    pass
+            day_labels = []
+            for d in sorted(active_days):
+                try:
+                    dt = datetime.strptime(d, "%Y-%m-%d")
+                    day_labels.append(days_ru[dt.weekday()])
+                except Exception:
+                    day_labels.append(d)
+            days_str = ", ".join(day_labels) if day_labels else "—"
+
+            prefix_counts = defaultdict(int)
+            word_counts = defaultdict(int)
+            for cm in user_commits:
+                msg = (cm.get("msg") or "").strip()
+                if not msg:
+                    continue
+                lower = msg.lower()
+                for pfx in prefixes:
+                    if lower.startswith(pfx) or lower.startswith(f"{pfx}(") or lower.startswith(f"{pfx}:"):
+                        prefix_counts[pfx] += 1
+                        break
+                for w in re.findall(r'[a-zA-Zа-яА-ЯёЁ]{4,}', lower):
+                    if w not in stop_words:
+                        word_counts[w] += 1
+            theme_parts = []
+            if prefix_counts:
+                theme_parts.append(", ".join(
+                    f"{k}:{v}" for k, v in sorted(prefix_counts.items(), key=lambda x: -x[1])
+                ))
+            if word_counts:
+                top_words = [w for w, _ in sorted(word_counts.items(), key=lambda x: -x[1])[:5]]
+                if top_words:
+                    theme_parts.append("темы: " + ", ".join(top_words))
+            themes_str = "; ".join(theme_parts) if theme_parts else "—"
+
+            pr_parts = []
+            if o:
+                pr_parts.append(f"открыл {o}")
+            if r:
+                pr_parts.append(f"ревью {r}")
+            if m:
+                pr_parts.append(f"слил {m}")
+            if c:
+                pr_parts.append(f"закрыл {c}")
+            pr_str = ", ".join(pr_parts) if pr_parts else "нет"
+
+            pr_links = []
+            for it in pr_data.get("opened", []) + pr_data.get("merged", []) + pr_data.get("closed", []):
+                num = it.get("number")
+                repo = it.get("repo")
+                if num and repo:
+                    pr_links.append(f"#{num} ({repo})")
+
+            lines.append(f"@{tg} / {login}")
+            lines.append(
+                f"  Коммиты: {len(user_commits)} в {len(repos)} репоз. | "
+                f"ветки: {', '.join(branches) if branches else '—'}"
+            )
+            lines.append(f"  Дни: {days_str}")
+            lines.append(f"  Темы: {themes_str}")
+            lines.append(
+                f"  PR: {pr_str}" + (f" ({', '.join(pr_links)})" if pr_links else "")
+            )
+            lines.append("")
+
+        if len(lines) <= 2:
+            lines.append("Нет активности за неделю.")
+        return "\n".join(lines)
+
+    async def _handle_week_summary(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /summary — саммари по сотрудникам за неделю.
+
+        /summary — текущая неделя, /summary last — прошлая.
+        Доступ: только личный чат, только denis_arger.
+        """
+        message = update.effective_message
+        user = update.effective_user
+        chat = update.effective_chat
+        if message is None or user is None or chat is None:
+            return
+        if chat.type != 'private':
+            await message.reply_text('Команда доступна только в личном чате.')
+            return
+        tg_username = (user.username or '').lstrip('@').lower()
+        if tg_username != 'denis_arger':
+            await message.reply_text('Команда недоступна.')
+            return
+
+        args = context.args or []
+        weeks_ago = 1 if any(a.lower() in ('last', 'prev', 'previous') for a in args) else 0
+
+        try:
+            await message.reply_text('Формирую саммари, подождите...')
+            loop = asyncio.get_event_loop()
+
+            commits, start_local, end_local = await loop.run_in_executor(
+                None, self._collect_commits_all_authors_week, weeks_ago
+            )
+            report, _, _ = await loop.run_in_executor(None, self._collect_weekly_report)
+
+            text = self._build_author_summaries(commits, report, start_local, end_local)
+
+            for part in self._split_message(text):
+                await message.reply_text(part)
+        except Exception as e:
+            logger.exception('/summary failed')
+            await message.reply_text(f'Ошибка: {e}')
 
 
 if __name__ == "__main__":
