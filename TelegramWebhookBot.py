@@ -102,6 +102,13 @@ class TelegramWebhookBot:
             self.review_reminder_hours = 24.0
         self.review_reminder_threshold = self.review_reminder_hours * 3600
 
+        # PR conflict notifications config
+        try:
+            self.pr_conflict_notify_hours = float(os.getenv("PR_CONFLICT_NOTIFY_INTERVAL_HOURS", "24"))
+        except (TypeError, ValueError):
+            self.pr_conflict_notify_hours = 24.0
+        self.pr_conflict_throttle_prefix = "pr-conflict:"
+
         self.app = Flask(__name__)
         self.app.route("/", methods=["POST"])(self.webhook)
         self.app.route("/", methods=["GET"])(self.health_check)
@@ -112,6 +119,7 @@ class TelegramWebhookBot:
         self.app.route("/set-webhook", methods=["GET"])(self.set_telegram_webhook)
         self.app.route("/get-webhook-info", methods=["GET"])(self.get_telegram_webhook_info)
         self.app.route("/prs-to-review", methods=["GET"])(self.prs_to_review)
+        self.app.route("/pr-conflicts-check", methods=["GET"])(self.pr_conflicts_check)
 
         # Персистентный кэш ответов Gitea (файл в той же директории).
         # Ключ: (method, path, params) -> (timestamp, data).
@@ -365,6 +373,15 @@ class TelegramWebhookBot:
             return jsonify({"status": "ok", "reviewer": reviewer_login, "count": len(items), "prs": items}), 200
         except Exception:
             logger.exception("/prs-to-review failed")
+            return jsonify({"status": "error", "message": "Internal error"}), 500
+
+    def pr_conflicts_check(self):
+        """GET /pr-conflicts-check — cron endpoint to check PRs for conflicts and branch behind status."""
+        try:
+            asyncio.run(self.send_pr_conflict_notifications())
+            return jsonify({"status": "success"}), 200
+        except Exception:
+            logger.exception("PR conflict check failed")
             return jsonify({"status": "error", "message": "Internal error"}), 500
 
     def run(self, host: str = "127.0.0.1", port: int = 3333):
@@ -894,6 +911,126 @@ class TelegramWebhookBot:
             f"Напоминание о непроверенном PR #{number} отправлено в Telegram."
         )
         self._gitea_post_comment(owner, repo, number, marker_body)
+
+    # ------------------------------------------------------------------ #
+    # PR conflict notifications (Gitea API + крон)
+    # ------------------------------------------------------------------ #
+    async def send_pr_conflict_notifications(self) -> None:
+        """Проверяет открытые PR на конфликты слияния и отставание ветки.
+
+        Шлёт уведомление в Telegram-чат автору PR, если:
+        - в PR есть merge-конфликты (has_conflicts или mergeable=False), ИЛИ
+        - head-ветка отстаёт от base-ветки (behind_by > 0).
+        """
+        if not self.gitea_url or not self.gitea_token:
+            logger.warning("Gitea API not configured (GITEA_URL/GITEA_TOKEN) — skipping PR conflict check")
+            return
+
+        repos = self._normalized_repositories()
+        if not repos:
+            logger.warning("No repositories found via Gitea API")
+            return
+
+        for full_name in repos:
+            parsed = self._extract_owner_repo(full_name)
+            if not parsed:
+                logger.warning("Invalid repository format: %s", full_name)
+                continue
+            owner, repo = parsed
+            await self._check_repository_conflicts(owner, repo)
+
+    async def _check_repository_conflicts(self, owner: str, repo: str) -> None:
+        prs = self._gitea_list_open_prs(owner, repo)
+        for pr in prs:
+            try:
+                await self._check_pr_conflicts(owner, repo, pr)
+            except Exception:
+                logger.exception("Failed to check PR #%s in %s/%s",
+                                 pr.get("number"), owner, repo)
+
+    async def _check_pr_conflicts(self, owner: str, repo: str, pr: Dict) -> None:
+        number = pr.get("number")
+        if not number:
+            return
+
+        state = (pr.get("state") or "").lower()
+        if state != "open":
+            return
+
+        # Пропускаем WIP/черновики
+        if self._is_wip_pr(pr):
+            logger.debug("Skipping WIP PR #%s in %s/%s", number, owner, repo)
+            return
+
+        # Получаем детали PR для has_conflicts, mergeable, head/base refs
+        pr_detail = self._gitea_get_pr(owner, repo, number)
+        if not pr_detail:
+            logger.warning("Failed to fetch PR details for #%s in %s/%s", number, owner, repo)
+            return
+
+        # Конфликты: has_conflicts=true ИЛИ mergeable=false
+        conflicts = bool(pr_detail.get("has_conflicts")) or pr_detail.get("mergeable") is False
+
+        # Отставание: compare API base...head -> behind_by
+        head_ref = (pr_detail.get("head") or {}).get("ref")
+        base_ref = (pr_detail.get("base") or {}).get("ref")
+        behind = None
+        if head_ref and base_ref:
+            compare = self._gitea_request("GET", f"/repos/{owner}/{repo}/compare/{base_ref}...{head_ref}")
+            if compare is not None:
+                behind = compare.get("behind_by", 0)
+            else:
+                logger.debug("Compare API failed for %s/%s#%s, skipping behind check", owner, repo, number)
+
+        # Если нет конфликтов и нет отставания (или compare не удался) — ничего не шлём
+        if not conflicts and (behind is None or behind == 0):
+            return
+
+        author_login = (pr_detail.get("user") or {}).get("login")
+        tg = self._tg_name(author_login)
+        if not tg:
+            logger.debug("PR author %s not in users.json, skipping notification for #%s", author_login, number)
+            return
+
+        url = pr_detail.get("html_url") or f"{self.gitea_url}/{owner}/{repo}/pull/{number}"
+        text = self._build_pr_conflict_text(
+            author_tg=tg,
+            number=number,
+            url=url,
+            owner=owner,
+            repo=repo,
+            head_ref=head_ref or "?",
+            base_ref=base_ref or "?",
+            conflicts=conflicts,
+            behind=behind,
+        )
+
+        throttle_key = f"{self.pr_conflict_throttle_prefix}{owner}:{repo}:{number}"
+        # Используем отдельный интервал для PR-конфликтов (PR_CONFLICT_NOTIFY_INTERVAL_HOURS)
+        # Временно переопределяем throttle interval для этого вызова
+        old_interval = self._throttle_interval
+        self._throttle_interval = int(self.pr_conflict_notify_hours * 3600)
+        try:
+            await self.deliver(Notification(text=text, rep_link=url, throttle_key=throttle_key))
+        finally:
+            self._throttle_interval = old_interval
+
+    @staticmethod
+    def _build_pr_conflict_text(author_tg: str, number: int, url: str,
+                                 owner: str, repo: str, head_ref: str, base_ref: str,
+                                 conflicts: bool, behind: Optional[int]) -> str:
+        """Формирует текст уведомления о конфликтах/отставании PR."""
+        issues = []
+        if conflicts:
+            issues.append("есть конфликты при слиянии")
+        if behind is not None and behind > 0:
+            issues.append(f"ветка <code>{html.escape(head_ref)}</code> отстаёт от <code>{html.escape(base_ref)}</code> на {behind} коммит(а)")
+
+        issues_str = "; ".join(issues)
+        return (
+            f"🔔 @{author_tg}\n"
+            f"⚠️ PR <a href=\"{url}\">#{number}</a> ({owner}/{repo}): {issues_str}"
+        )
 
     # ------------------------------------------------------------------ #
     # Helpers — определение, требует ли PR ревью (используется /check)
