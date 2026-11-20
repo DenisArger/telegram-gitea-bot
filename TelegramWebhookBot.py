@@ -927,6 +927,7 @@ class TelegramWebhookBot:
             return
 
         repos = self._normalized_repositories()
+        logger.info("PR conflict check: scanning %d repositories", len(repos))
         if not repos:
             logger.warning("No repositories found via Gitea API")
             return
@@ -941,6 +942,7 @@ class TelegramWebhookBot:
 
     async def _check_repository_conflicts(self, owner: str, repo: str) -> None:
         prs = self._gitea_list_open_prs(owner, repo)
+        logger.info("PR conflict check: %s/%s — %d open PRs", owner, repo, len(prs))
         for pr in prs:
             try:
                 await self._check_pr_conflicts(owner, repo, pr)
@@ -959,7 +961,7 @@ class TelegramWebhookBot:
 
         # Пропускаем WIP/черновики
         if self._is_wip_pr(pr):
-            logger.debug("Skipping WIP PR #%s in %s/%s", number, owner, repo)
+            logger.info("Skipping WIP PR #%s in %s/%s", number, owner, repo)
             return
 
         # Получаем детали PR для has_conflicts, mergeable, head/base refs
@@ -971,25 +973,31 @@ class TelegramWebhookBot:
         # Конфликты: has_conflicts=true ИЛИ mergeable=false
         conflicts = bool(pr_detail.get("has_conflicts")) or pr_detail.get("mergeable") is False
 
-        # Отставание: compare API base...head -> behind_by
+        # Рефы для сообщения
         head_ref = (pr_detail.get("head") or {}).get("ref")
         base_ref = (pr_detail.get("base") or {}).get("ref")
-        behind = None
-        if head_ref and base_ref:
-            compare = self._gitea_request("GET", f"/repos/{owner}/{repo}/compare/{base_ref}...{head_ref}")
-            if compare is not None:
-                behind = compare.get("behind_by", 0)
-            else:
-                logger.debug("Compare API failed for %s/%s#%s, skipping behind check", owner, repo, number)
 
-        # Если нет конфликтов и нет отставания (или compare не удался) — ничего не шлём
+        # Отставание: Gitea не даёт behind_by в compare base...head.
+        # Используем merge_base из PR: сравниваем merge_base с base.sha (актуальной вершиной base-ветки).
+        base_sha = (pr_detail.get("base") or {}).get("sha")
+        merge_base = pr_detail.get("merge_base")
+        behind = None
+        if merge_base and base_sha and merge_base != base_sha:
+            compare = self._gitea_request("GET", f"/repos/{owner}/{repo}/compare/{merge_base}...{base_sha}")
+            if compare is not None:
+                behind = compare.get("total_commits", 0)
+            else:
+                logger.debug("Compare API failed for %s/%s#%s (merge_base...base), skipping behind check", owner, repo, number)
+
+        # Если нет конфликтов и нет отставания — ничего не шлём
         if not conflicts and (behind is None or behind == 0):
+            logger.info("PR #%s in %s/%s: no conflicts, behind=%s — skipping", number, owner, repo, behind)
             return
 
         author_login = (pr_detail.get("user") or {}).get("login")
         tg = self._tg_name(author_login)
         if not tg:
-            logger.debug("PR author %s not in users.json, skipping notification for #%s", author_login, number)
+            logger.info("PR author %s not in users.json, skipping notification for #%s", author_login, number)
             return
 
         url = pr_detail.get("html_url") or f"{self.gitea_url}/{owner}/{repo}/pull/{number}"
